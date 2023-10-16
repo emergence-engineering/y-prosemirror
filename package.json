@@ -2,18 +2,18 @@
   "name": "y-prosemirror",
   "version": "1.0.20",
   "description": "Prosemirror bindings for Yjs",
-  "main": "./dist/y-prosemirror.cjs",
+  "main": "./dist2/y-prosemirror.cjs",
   "module": "./src/y-prosemirror.js",
   "type": "module",
-  "types": "./dist/src/y-prosemirror.d.ts",
+  "types": "./dist2/src/y-prosemirror.d.ts",
   "sideEffects": false,
   "funding": {
     "type": "GitHub Sponsors ❤",
     "url": "https://github.com/sponsors/dmonad"
   },
   "scripts": {
-    "dist": "rm -rf dist && rollup -c && tsc",
-    "test": "npm run lint && rollup -c && node dist/test.cjs",
+    "dist": "rm -rf dist2 && rollup -c && tsc",
+    "test": "npm run lint && rollup -c && node dist2/test.cjs",
     "lint": "standard && tsc",
     "watch": "rollup -wc",
     "debug": "concurrently 'http-server -o test.html' 'npm run watch'",
@@ -23,12 +23,12 @@
   "exports": {
     ".": {
       "import": "./src/y-prosemirror.js",
-      "require": "./dist/y-prosemirror.cjs"
+      "require": "./dist2/y-prosemirror.cjs"
     }
   },
   "files": [
-    "dist/*",
-    "!dist/test.*",
+    "dist2/*",
+    "!dist2/test.*",
     "src/*"
   ],
   "repository": {

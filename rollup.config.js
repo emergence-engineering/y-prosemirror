@@ -18,7 +18,7 @@ export default [{
   input: './src/y-prosemirror.js',
   output: [{
     name: 'Y',
-    file: 'dist/y-prosemirror.cjs',
+    file: 'dist2/y-prosemirror.cjs',
     format: 'cjs',
     sourcemap: true
   }],
@@ -27,7 +27,7 @@ export default [{
   input: './test/index.js',
   output: {
     name: 'test',
-    file: 'dist/test.js',
+    file: 'dist2/test.js',
     format: 'iife',
     sourcemap: true
   },
@@ -42,7 +42,7 @@ export default [{
   input: './demo/prosemirror.js',
   output: {
     name: 'demo',
-    file: 'demo/dist/prosemirror.js',
+    file: 'demo/dist2/prosemirror.js',
     format: 'iife',
     sourcemap: true
   },
@@ -56,7 +56,7 @@ export default [{
   input: './test/index.node.js',
   output: {
     name: 'test',
-    file: 'dist/test.cjs',
+    file: 'dist2/test.cjs',
     format: 'cjs',
     sourcemap: true
   },
