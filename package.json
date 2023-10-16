@@ -42,7 +42,6 @@
   "license": "MIT",
   "standard": {
     "ignore": [
-      "/dist",
       "/node_modules",
       "/docs"
     ]
