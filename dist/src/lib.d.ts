@@ -54,6 +54,8 @@ export function prosemirrorJSONToYDoc(schema: Schema, state: any, xmlFragment?: 
  */
 export function prosemirrorJSONToYXmlFragment(schema: Schema, state: any, xmlFragment?: Y.XmlFragment): Y.XmlFragment;
 /**
+ * @deprecated Use `yXmlFragmentToProseMirrorRootNode` instead
+ *
  * Utility method to convert a Y.Doc to a Prosemirror Doc node.
  *
  * @param {Schema} schema
@@ -62,6 +64,9 @@ export function prosemirrorJSONToYXmlFragment(schema: Schema, state: any, xmlFra
  */
 export function yDocToProsemirror(schema: Schema, ydoc: Y.Doc): Node;
 /**
+ *
+ * @deprecated Use `yXmlFragmentToProseMirrorRootNode` instead
+ *
  * Utility method to convert a Y.XmlFragment to a Prosemirror Doc node.
  *
  * @param {Schema} schema
@@ -70,6 +75,9 @@ export function yDocToProsemirror(schema: Schema, ydoc: Y.Doc): Node;
  */
 export function yXmlFragmentToProsemirror(schema: Schema, xmlFragment: Y.XmlFragment): Node;
 /**
+ *
+ * @deprecated Use `yXmlFragmentToProseMirrorRootNode` instead
+ *
  * Utility method to convert a Y.Doc to Prosemirror compatible JSON.
  *
  * @param {Y.Doc} ydoc
@@ -78,6 +86,8 @@ export function yXmlFragmentToProsemirror(schema: Schema, xmlFragment: Y.XmlFrag
  */
 export function yDocToProsemirrorJSON(ydoc: Y.Doc, xmlFragment?: string): Record<string, any>;
 /**
+ * @deprecated Use `yXmlFragmentToProseMirrorRootNode` instead
+ *
  * Utility method to convert a Y.Doc to Prosemirror compatible JSON.
  *
  * @param {Y.XmlFragment} xmlFragment The fragment, which must be part of a Y.Doc.
@@ -85,12 +95,19 @@ export function yDocToProsemirrorJSON(ydoc: Y.Doc, xmlFragment?: string): Record
  */
 export function yXmlFragmentToProsemirrorJSON(xmlFragment: Y.XmlFragment): Record<string, any>;
 export function setMeta(view: any, key: any, value: any): void;
-export function absolutePositionToRelativePosition(pos: number, type: Y.XmlFragment, mapping: Map<Y.AbstractType<any>, Node<any> | Node<any>[]>): any;
-export function relativePositionToAbsolutePosition(y: Y.Doc, documentType: Y.XmlFragment, relPos: any, mapping: Map<Y.AbstractType<any>, Node<any> | Node<any>[]>): null | number;
+export function absolutePositionToRelativePosition(pos: number, type: Y.XmlFragment, mapping: ProsemirrorMapping): any;
+export function relativePositionToAbsolutePosition(y: Y.Doc, documentType: Y.XmlFragment, relPos: any, mapping: ProsemirrorMapping): null | number;
+export function yXmlFragmentToProseMirrorFragment(yXmlFragment: Y.XmlFragment, schema: Schema): Fragment;
+export function yXmlFragmentToProseMirrorRootNode(yXmlFragment: Y.XmlFragment, schema: Schema): Node;
+export function initProseMirrorDoc(yXmlFragment: Y.XmlFragment, schema: Schema): {
+    doc: Node;
+    mapping: ProsemirrorMapping;
+};
 /**
  * Either a node if type is YXmlElement or an Array of text nodes if YXmlText
  */
-export type ProsemirrorMapping = Map<Y.AbstractType<any>, Node<any> | Node<any>[]>;
-import { Node } from "prosemirror-model";
-import * as Y from "yjs";
-import { Schema } from "prosemirror-model";
+export type ProsemirrorMapping = Map<Y.AbstractType<any>, Node | Array<Node>>;
+import { Node } from 'prosemirror-model';
+import * as Y from 'yjs';
+import { Schema } from 'prosemirror-model';
+import { Fragment } from 'prosemirror-model';

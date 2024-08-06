@@ -6,5 +6,10 @@ export function yUndoPlugin({ protectedNodes, trackedOrigins, undoManager }?: {
     protectedNodes?: Set<string>;
     trackedOrigins?: any[];
     undoManager?: any;
-}): Plugin<any, any>;
-import { Plugin } from "prosemirror-state";
+}): Plugin<{
+    undoManager: any;
+    prevSel: any;
+    hasUndoOps: boolean;
+    hasRedoOps: boolean;
+}>;
+import { Plugin } from 'prosemirror-state';

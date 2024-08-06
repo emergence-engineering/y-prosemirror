@@ -20,6 +20,7 @@ var f = require('lib0/function');
 var set = require('lib0/set');
 var logging = require('lib0/logging');
 var time = require('lib0/time');
+var string = require('lib0/string');
 var iterator = require('lib0/iterator');
 var object = require('lib0/object');
 var prosemirrorState = require('prosemirror-state');
@@ -29,9 +30,10 @@ var prosemirrorTransform = require('prosemirror-transform');
 var PModel = require('prosemirror-model');
 var mutex = require('lib0/mutex');
 var diff = require('lib0/diff');
+var eventloop = require('lib0/eventloop');
 var environment = require('lib0/environment');
 var dom = require('lib0/dom');
-var eventloop = require('lib0/eventloop');
+var url = require('url');
 
 function _interopDefaultLegacy (e) { return e && typeof e === 'object' && 'default' in e ? e : { 'default': e }; }
 
@@ -72,13 +74,14 @@ var f__namespace = /*#__PURE__*/_interopNamespace(f);
 var set__namespace = /*#__PURE__*/_interopNamespace(set);
 var logging__namespace = /*#__PURE__*/_interopNamespace(logging);
 var time__namespace = /*#__PURE__*/_interopNamespace(time);
+var string__namespace = /*#__PURE__*/_interopNamespace(string);
 var iterator__namespace = /*#__PURE__*/_interopNamespace(iterator);
 var object__namespace = /*#__PURE__*/_interopNamespace(object);
 var basicSchema__namespace = /*#__PURE__*/_interopNamespace(basicSchema);
 var PModel__namespace = /*#__PURE__*/_interopNamespace(PModel);
+var eventloop__namespace = /*#__PURE__*/_interopNamespace(eventloop);
 var environment__namespace = /*#__PURE__*/_interopNamespace(environment);
 var dom__namespace = /*#__PURE__*/_interopNamespace(dom);
-var eventloop__namespace = /*#__PURE__*/_interopNamespace(eventloop);
 
 /**
  * This is an abstract interface that all Connectors should implement to keep them interchangeable.
@@ -86,9 +89,9 @@ var eventloop__namespace = /*#__PURE__*/_interopNamespace(eventloop);
  * @note This interface is experimental and it is not advised to actually inherit this class.
  *       It just serves as typing information.
  *
- * @extends {Observable<any>}
+ * @extends {ObservableV2<any>}
  */
-class AbstractConnector extends observable.Observable {
+class AbstractConnector extends observable.ObservableV2 {
   /**
    * @param {Doc} ydoc
    * @param {any} awareness
@@ -257,7 +260,7 @@ const mergeDeleteSets = dss => {
  * @function
  */
 const addToDeleteSet = (ds, client, clock, length) => {
-  map__namespace.setIfUndefined(ds.clients, client, () => []).push(new DeleteItem(clock, length));
+  map__namespace.setIfUndefined(ds.clients, client, () => /** @type {Array<DeleteItem>} */ ([])).push(new DeleteItem(clock, length));
 };
 
 const createDeleteSet = () => new DeleteSet();
@@ -305,17 +308,21 @@ const createDeleteSetFromStructStore = ss => {
  */
 const writeDeleteSet = (encoder, ds) => {
   encoding__namespace.writeVarUint(encoder.restEncoder, ds.clients.size);
-  ds.clients.forEach((dsitems, client) => {
-    encoder.resetDsCurVal();
-    encoding__namespace.writeVarUint(encoder.restEncoder, client);
-    const len = dsitems.length;
-    encoding__namespace.writeVarUint(encoder.restEncoder, len);
-    for (let i = 0; i < len; i++) {
-      const item = dsitems[i];
-      encoder.writeDsClock(item.clock);
-      encoder.writeDsLen(item.len);
-    }
-  });
+
+  // Ensure that the delete set is written in a deterministic order
+  array__namespace.from(ds.clients.entries())
+    .sort((a, b) => b[0] - a[0])
+    .forEach(([client, dsitems]) => {
+      encoder.resetDsCurVal();
+      encoding__namespace.writeVarUint(encoder.restEncoder, client);
+      const len = dsitems.length;
+      encoding__namespace.writeVarUint(encoder.restEncoder, len);
+      for (let i = 0; i < len; i++) {
+        const item = dsitems[i];
+        encoder.writeDsClock(item.clock);
+        encoder.writeDsLen(item.len);
+      }
+    });
 };
 
 /**
@@ -333,7 +340,7 @@ const readDeleteSet = decoder => {
     const client = decoding__namespace.readVarUint(decoder.restDecoder);
     const numberOfDeletes = decoding__namespace.readVarUint(decoder.restDecoder);
     if (numberOfDeletes > 0) {
-      const dsField = map__namespace.setIfUndefined(ds.clients, client, () => []);
+      const dsField = map__namespace.setIfUndefined(ds.clients, client, () => /** @type {Array<DeleteItem>} */ ([]));
       for (let i = 0; i < numberOfDeletes; i++) {
         dsField.push(new DeleteItem(decoder.readDsClock(), decoder.readDsLen()));
       }
@@ -412,8 +419,29 @@ const readAndApplyDeleteSet = (decoder, transaction, store) => {
 };
 
 /**
+ * @param {DeleteSet} ds1
+ * @param {DeleteSet} ds2
+ */
+const equalDeleteSets = (ds1, ds2) => {
+  if (ds1.clients.size !== ds2.clients.size) return false
+  for (const [client, deleteItems1] of ds1.clients.entries()) {
+    const deleteItems2 = /** @type {Array<import('../internals.js').DeleteItem>} */ (ds2.clients.get(client));
+    if (deleteItems2 === undefined || deleteItems1.length !== deleteItems2.length) return false
+    for (let i = 0; i < deleteItems1.length; i++) {
+      const di1 = deleteItems1[i];
+      const di2 = deleteItems2[i];
+      if (di1.clock !== di2.clock || di1.len !== di2.len) {
+        return false
+      }
+    }
+  }
+  return true
+};
+
+/**
  * @module Y
  */
+
 
 const generateNewClientId = random__namespace.uint32;
 
@@ -429,12 +457,28 @@ const generateNewClientId = random__namespace.uint32;
  */
 
 /**
- * A Yjs instance handles the state of shared data.
- * @extends Observable<string>
+ * @typedef {Object} DocEvents
+ * @property {function(Doc):void} DocEvents.destroy
+ * @property {function(Doc):void} DocEvents.load
+ * @property {function(boolean, Doc):void} DocEvents.sync
+ * @property {function(Uint8Array, any, Doc, Transaction):void} DocEvents.update
+ * @property {function(Uint8Array, any, Doc, Transaction):void} DocEvents.updateV2
+ * @property {function(Doc):void} DocEvents.beforeAllTransactions
+ * @property {function(Transaction, Doc):void} DocEvents.beforeTransaction
+ * @property {function(Transaction, Doc):void} DocEvents.beforeObserverCalls
+ * @property {function(Transaction, Doc):void} DocEvents.afterTransaction
+ * @property {function(Transaction, Doc):void} DocEvents.afterTransactionCleanup
+ * @property {function(Doc, Array<Transaction>):void} DocEvents.afterAllTransactions
+ * @property {function({ loaded: Set<Doc>, added: Set<Doc>, removed: Set<Doc> }, Doc, Transaction):void} DocEvents.subdocs
  */
-class Doc extends observable.Observable {
+
+/**
+ * A Yjs instance handles the state of shared data.
+ * @extends ObservableV2<DocEvents>
+ */
+class Doc extends observable.ObservableV2 {
   /**
-   * @param {DocOpts} [opts] configuration
+   * @param {DocOpts} opts configuration
    */
   constructor ({ guid = random__namespace.uuidv4(), collectionid = null, gc = true, gcFilter = () => true, meta = null, autoLoad = false, shouldLoad = true } = {}) {
     super();
@@ -468,13 +512,57 @@ class Doc extends observable.Observable {
     this.shouldLoad = shouldLoad;
     this.autoLoad = autoLoad;
     this.meta = meta;
+    /**
+     * This is set to true when the persistence provider loaded the document from the database or when the `sync` event fires.
+     * Note that not all providers implement this feature. Provider authors are encouraged to fire the `load` event when the doc content is loaded from the database.
+     *
+     * @type {boolean}
+     */
     this.isLoaded = false;
+    /**
+     * This is set to true when the connection provider has successfully synced with a backend.
+     * Note that when using peer-to-peer providers this event may not provide very useful.
+     * Also note that not all providers implement this feature. Provider authors are encouraged to fire
+     * the `sync` event when the doc has been synced (with `true` as a parameter) or if connection is
+     * lost (with false as a parameter).
+     */
+    this.isSynced = false;
+    /**
+     * Promise that resolves once the document has been loaded from a presistence provider.
+     */
     this.whenLoaded = promise__namespace.create(resolve => {
       this.on('load', () => {
         this.isLoaded = true;
         resolve(this);
       });
     });
+    const provideSyncedPromise = () => promise__namespace.create(resolve => {
+      /**
+       * @param {boolean} isSynced
+       */
+      const eventHandler = (isSynced) => {
+        if (isSynced === undefined || isSynced === true) {
+          this.off('sync', eventHandler);
+          resolve();
+        }
+      };
+      this.on('sync', eventHandler);
+    });
+    this.on('sync', isSynced => {
+      if (isSynced === false && this.isSynced) {
+        this.whenSynced = provideSyncedPromise();
+      }
+      this.isSynced = isSynced === undefined || isSynced === true;
+      if (this.isSynced && !this.isLoaded) {
+        this.emit('load', [this]);
+      }
+    });
+    /**
+     * Promise that resolves once the document has been synced with a backend.
+     * This promise is recreated when the connection is lost.
+     * Note the documentation about the `isSynced` property.
+     */
+    this.whenSynced = provideSyncedPromise();
   }
 
   /**
@@ -499,7 +587,7 @@ class Doc extends observable.Observable {
   }
 
   getSubdocGuids () {
-    return new Set(Array.from(this.subdocs).map(doc => doc.guid))
+    return new Set(array__namespace.from(this.subdocs).map(doc => doc.guid))
   }
 
   /**
@@ -508,42 +596,45 @@ class Doc extends observable.Observable {
    * that happened inside of the transaction are sent as one message to the
    * other peers.
    *
-   * @param {function(Transaction):void} f The function that should be executed as a transaction
+   * @template T
+   * @param {function(Transaction):T} f The function that should be executed as a transaction
    * @param {any} [origin] Origin of who started the transaction. Will be stored on transaction.origin
+   * @return T
    *
    * @public
    */
   transact (f, origin = null) {
-    transact(this, f, origin);
+    return transact(this, f, origin)
   }
 
   /**
    * Define a shared data type.
    *
-   * Multiple calls of `y.get(name, TypeConstructor)` yield the same result
+   * Multiple calls of `ydoc.get(name, TypeConstructor)` yield the same result
    * and do not overwrite each other. I.e.
-   * `y.define(name, Y.Array) === y.define(name, Y.Array)`
+   * `ydoc.get(name, Y.Array) === ydoc.get(name, Y.Array)`
    *
-   * After this method is called, the type is also available on `y.share.get(name)`.
+   * After this method is called, the type is also available on `ydoc.share.get(name)`.
    *
    * *Best Practices:*
-   * Define all types right after the Yjs instance is created and store them in a separate object.
+   * Define all types right after the Y.Doc instance is created and store them in a separate object.
    * Also use the typed methods `getText(name)`, `getArray(name)`, ..
    *
+   * @template {typeof AbstractType<any>} Type
    * @example
-   *   const y = new Y(..)
+   *   const ydoc = new Y.Doc(..)
    *   const appState = {
-   *     document: y.getText('document')
-   *     comments: y.getArray('comments')
+   *     document: ydoc.getText('document')
+   *     comments: ydoc.getArray('comments')
    *   }
    *
    * @param {string} name
-   * @param {Function} TypeConstructor The constructor of the type definition. E.g. Y.Text, Y.Array, Y.Map, ...
-   * @return {AbstractType<any>} The created type. Constructed with TypeConstructor
+   * @param {Type} TypeConstructor The constructor of the type definition. E.g. Y.Text, Y.Array, Y.Map, ...
+   * @return {InstanceType<Type>} The created type. Constructed with TypeConstructor
    *
    * @public
    */
-  get (name, TypeConstructor = AbstractType) {
+  get (name, TypeConstructor = /** @type {any} */ (AbstractType)) {
     const type = map__namespace.setIfUndefined(this.share, name, () => {
       // @ts-ignore
       const t = new TypeConstructor();
@@ -569,12 +660,12 @@ class Doc extends observable.Observable {
         t._length = type._length;
         this.share.set(name, t);
         t._integrate(this, null);
-        return t
+        return /** @type {InstanceType<Type>} */ (t)
       } else {
         throw new Error(`Type with the name ${name} has already been defined with a different constructor`)
       }
     }
-    return type
+    return /** @type {InstanceType<Type>} */ (type)
   }
 
   /**
@@ -585,8 +676,7 @@ class Doc extends observable.Observable {
    * @public
    */
   getArray (name = '') {
-    // @ts-ignore
-    return this.get(name, YArray)
+    return /** @type {YArray<T>} */ (this.get(name, YArray))
   }
 
   /**
@@ -596,7 +686,6 @@ class Doc extends observable.Observable {
    * @public
    */
   getText (name = '') {
-    // @ts-ignore
     return this.get(name, YText)
   }
 
@@ -608,8 +697,17 @@ class Doc extends observable.Observable {
    * @public
    */
   getMap (name = '') {
-    // @ts-ignore
-    return this.get(name, YMap)
+    return /** @type {YMap<T>} */ (this.get(name, YMap))
+  }
+
+  /**
+   * @param {string} [name]
+   * @return {YXmlElement}
+   *
+   * @public
+   */
+  getXmlElement (name = '') {
+    return /** @type {YXmlElement<{[key:string]:string}>} */ (this.get(name, YXmlElement))
   }
 
   /**
@@ -619,7 +717,6 @@ class Doc extends observable.Observable {
    * @public
    */
   getXmlFragment (name = '') {
-    // @ts-ignore
     return this.get(name, YXmlFragment)
   }
 
@@ -663,25 +760,10 @@ class Doc extends observable.Observable {
         transaction.subdocsRemoved.add(this);
       }, null, true);
     }
-    this.emit('destroyed', [true]);
+    // @ts-ignore
+    this.emit('destroyed', [true]); // DEPRECATED!
     this.emit('destroy', [this]);
     super.destroy();
-  }
-
-  /**
-   * @param {string} eventName
-   * @param {function(...any):any} f
-   */
-  on (eventName, f) {
-    super.on(eventName, f);
-  }
-
-  /**
-   * @param {string} eventName
-   * @param {function} f
-   */
-  off (eventName, f) {
-    super.off(eventName, f);
   }
 }
 
@@ -1276,6 +1358,23 @@ class UpdateEncoderV2 extends DSEncoderV2 {
 }
 
 /**
+ * @module encoding
+ */
+/*
+ * We use the first five bits in the info flag for determining the type of the struct.
+ *
+ * 0: GC
+ * 1: Item with Deleted content
+ * 2: Item with JSON content
+ * 3: Item with Binary content
+ * 4: Item with String content
+ * 5: Item with Embed content (for richtext content)
+ * 6: Item with Format content (a formatting marker for richtext content)
+ * 7: Item with Type
+ */
+
+
+/**
  * @param {UpdateEncoderV1 | UpdateEncoderV2} encoder
  * @param {Array<GC|Item>} structs All structs by `client`
  * @param {number} client
@@ -1316,7 +1415,7 @@ const writeClientsStructs = (encoder, store, _sm) => {
       sm.set(client, clock);
     }
   });
-  getStateVector(store).forEach((clock, client) => {
+  getStateVector(store).forEach((_clock, client) => {
     if (!_sm.has(client)) {
       sm.set(client, 0);
     }
@@ -1325,9 +1424,8 @@ const writeClientsStructs = (encoder, store, _sm) => {
   encoding__namespace.writeVarUint(encoder.restEncoder, sm.size);
   // Write items with higher client ids first
   // This heavily improves the conflict algorithm.
-  Array.from(sm.entries()).sort((a, b) => b[0] - a[0]).forEach(([client, clock]) => {
-    // @ts-ignore
-    writeStructs(encoder, store.clients.get(client), client, clock);
+  array__namespace.from(sm.entries()).sort((a, b) => b[0] - a[0]).forEach(([client, clock]) => {
+    writeStructs(encoder, /** @type {Array<GC|Item>} */ (store.clients.get(client)), client, clock);
   });
 };
 
@@ -1460,7 +1558,7 @@ const integrateStructs = (transaction, store, clientsStructRefs) => {
    */
   const stack = [];
   // sort them so that we take the higher id first, in case of conflicts the lower id will probably not conflict with the id from the higher user.
-  let clientsStructRefsIds = Array.from(clientsStructRefs.keys()).sort((a, b) => a - b);
+  let clientsStructRefsIds = array__namespace.from(clientsStructRefs.keys()).sort((a, b) => a - b);
   if (clientsStructRefsIds.length === 0) {
     return null
   }
@@ -1480,7 +1578,7 @@ const integrateStructs = (transaction, store, clientsStructRefs) => {
     return nextStructsTarget
   };
   let curStructsTarget = getNextStructTarget();
-  if (curStructsTarget === null && stack.length === 0) {
+  if (curStructsTarget === null) {
     return null
   }
 
@@ -1830,7 +1928,7 @@ const decodeStateVector = decodedState => readStateVector(new DSDecoderV1(decodi
  */
 const writeStateVector = (encoder, sv) => {
   encoding__namespace.writeVarUint(encoder.restEncoder, sv.size);
-  Array.from(sv.entries()).sort((a, b) => b[0] - a[0]).forEach(([client, clock]) => {
+  array__namespace.from(sv.entries()).sort((a, b) => b[0] - a[0]).forEach(([client, clock]) => {
     encoding__namespace.writeVarUint(encoder.restEncoder, client); // @todo use a special client decoder that is based on mapping
     encoding__namespace.writeVarUint(encoder.restEncoder, clock);
   });
@@ -2128,7 +2226,7 @@ class PermanentUserData {
    * @param {Doc} doc
    * @param {number} clientid
    * @param {string} userDescription
-   * @param {Object} [conf]
+   * @param {Object} conf
    * @param {function(Transaction, DeleteSet):boolean} [conf.filter]
    */
   setUserMapping (doc, clientid, userDescription, { filter = () => true } = {}) {
@@ -2141,7 +2239,7 @@ class PermanentUserData {
       users.set(userDescription, user);
     }
     user.get('ids').push([clientid]);
-    users.observe(event => {
+    users.observe(_event => {
       setTimeout(() => {
         const userOverwrite = users.get(userDescription);
         if (userOverwrite !== user) {
@@ -2439,13 +2537,24 @@ const readRelativePosition = decoder => {
 const decodeRelativePosition = uint8Array => readRelativePosition(decoding__namespace.createDecoder(uint8Array));
 
 /**
+ * Transform a relative position to an absolute position.
+ *
+ * If you want to share the relative position with other users, you should set
+ * `followUndoneDeletions` to false to get consistent results across all clients.
+ *
+ * When calculating the absolute position, we try to follow the "undone deletions". This yields
+ * better results for the user who performed undo. However, only the user who performed the undo
+ * will get the better results, the other users don't know which operations recreated a deleted
+ * range of content. There is more information in this ticket: https://github.com/yjs/yjs/issues/638
+ *
  * @param {RelativePosition} rpos
  * @param {Doc} doc
+ * @param {boolean} followUndoneDeletions - whether to follow undone deletions - see https://github.com/yjs/yjs/issues/638
  * @return {AbsolutePosition|null}
  *
  * @function
  */
-const createAbsolutePositionFromRelativePosition = (rpos, doc) => {
+const createAbsolutePositionFromRelativePosition = (rpos, doc, followUndoneDeletions = true) => {
   const store = doc.store;
   const rightID = rpos.item;
   const typeID = rpos.type;
@@ -2457,7 +2566,7 @@ const createAbsolutePositionFromRelativePosition = (rpos, doc) => {
     if (getState(store, rightID.client) <= rightID.clock) {
       return null
     }
-    const res = followRedone(store, rightID);
+    const res = followUndoneDeletions ? followRedone(store, rightID) : { item: getItem(store, rightID), diff: 0 };
     const right = res.item;
     if (!(right instanceof Item)) {
       return null
@@ -2481,7 +2590,7 @@ const createAbsolutePositionFromRelativePosition = (rpos, doc) => {
         // type does not exist yet
         return null
       }
-      const { item } = followRedone(store, typeID);
+      const { item } = followUndoneDeletions ? followRedone(store, typeID) : { item: getItem(store, typeID) };
       if (item instanceof Item && item.content instanceof ContentType) {
         type = item.content.type;
       } else {
@@ -2635,12 +2744,20 @@ const splitSnapshotAffectedStructs = (transaction, snapshot) => {
         getItemCleanStart(transaction, createID(client, clock));
       }
     });
-    iterateDeletedStructs(transaction, snapshot.ds, item => {});
+    iterateDeletedStructs(transaction, snapshot.ds, _item => {});
     meta.add(snapshot);
   }
 };
 
 /**
+ * @example
+ *  const ydoc = new Y.Doc({ gc: false })
+ *  ydoc.getText().insert(0, 'world!')
+ *  const snapshot = Y.snapshot(ydoc)
+ *  ydoc.getText().insert(0, 'hello ')
+ *  const restored = Y.createDocFromSnapshot(ydoc, snapshot)
+ *  assert(restored.getText().toString() === 'world!')
+ *
  * @param {Doc} originDoc
  * @param {Snapshot} snapshot
  * @param {Doc} [newDoc] Optionally, you may define the Yjs document that receives the data from originDoc
@@ -2649,7 +2766,7 @@ const splitSnapshotAffectedStructs = (transaction, snapshot) => {
 const createDocFromSnapshot = (originDoc, snapshot, newDoc = new Doc()) => {
   if (originDoc.gc) {
     // we should not try to restore a GC-ed document, because some of the restored items might have their content deleted
-    throw new Error('originDoc must not be garbage collected')
+    throw new Error('Garbage-collection must be disabled in `originDoc`!')
   }
   const { sv, ds } = snapshot;
 
@@ -2687,6 +2804,29 @@ const createDocFromSnapshot = (originDoc, snapshot, newDoc = new Doc()) => {
   applyUpdateV2(newDoc, encoder.toUint8Array(), 'snapshot');
   return newDoc
 };
+
+/**
+ * @param {Snapshot} snapshot
+ * @param {Uint8Array} update
+ * @param {typeof UpdateDecoderV2 | typeof UpdateDecoderV1} [YDecoder]
+ */
+const snapshotContainsUpdateV2 = (snapshot, update, YDecoder = UpdateDecoderV2) => {
+  const updateDecoder = new YDecoder(decoding__namespace.createDecoder(update));
+  const lazyDecoder = new LazyStructReader(updateDecoder, false);
+  for (let curr = lazyDecoder.curr; curr !== null; curr = lazyDecoder.next()) {
+    if ((snapshot.sv.get(curr.id.client) || 0) < curr.id.clock + curr.length) {
+      return false
+    }
+  }
+  const mergedDS = mergeDeleteSets([snapshot.ds, readDeleteSet(updateDecoder)]);
+  return equalDeleteSets(snapshot.ds, mergedDS)
+};
+
+/**
+ * @param {Snapshot} snapshot
+ * @param {Uint8Array} update
+ */
+const snapshotContainsUpdate = (snapshot, update) => snapshotContainsUpdateV2(snapshot, update, UpdateDecoderV1);
 
 class StructStore {
   constructor () {
@@ -2931,7 +3071,8 @@ const iterateStructs = (transaction, structs, clockStart, len, f) => {
  * possible. Here is an example to illustrate the advantages of bundling:
  *
  * @example
- * const map = y.define('map', YMap)
+ * const ydoc = new Y.Doc()
+ * const map = ydoc.getMap('map')
  * // Log content when change is triggered
  * map.observe(() => {
  *   console.log('change triggered')
@@ -2940,7 +3081,7 @@ const iterateStructs = (transaction, structs, clockStart, len, f) => {
  * map.set('a', 0) // => "change triggered"
  * map.set('b', 0) // => "change triggered"
  * // When put in a transaction, it will trigger the log after the transaction:
- * y.transact(() => {
+ * ydoc.transact(() => {
  *   map.set('a', 1)
  *   map.set('b', 1)
  * }) // => "change triggered"
@@ -3017,6 +3158,10 @@ class Transaction {
      * @type {Set<Doc>}
      */
     this.subdocsLoaded = new Set();
+    /**
+     * @type {boolean}
+     */
+    this._needFormattingCleanup = false;
   }
 }
 
@@ -3053,18 +3198,29 @@ const addChangedTypeToTransaction = (transaction, type, parentSub) => {
 /**
  * @param {Array<AbstractStruct>} structs
  * @param {number} pos
+ * @return {number} # of merged structs
  */
-const tryToMergeWithLeft = (structs, pos) => {
-  const left = structs[pos - 1];
-  const right = structs[pos];
-  if (left.deleted === right.deleted && left.constructor === right.constructor) {
-    if (left.mergeWith(right)) {
-      structs.splice(pos, 1);
-      if (right instanceof Item && right.parentSub !== null && /** @type {AbstractType<any>} */ (right.parent)._map.get(right.parentSub) === right) {
-        /** @type {AbstractType<any>} */ (right.parent)._map.set(right.parentSub, /** @type {Item} */ (left));
+const tryToMergeWithLefts = (structs, pos) => {
+  let right = structs[pos];
+  let left = structs[pos - 1];
+  let i = pos;
+  for (; i > 0; right = left, left = structs[--i - 1]) {
+    if (left.deleted === right.deleted && left.constructor === right.constructor) {
+      if (left.mergeWith(right)) {
+        if (right instanceof Item && right.parentSub !== null && /** @type {AbstractType<any>} */ (right.parent)._map.get(right.parentSub) === right) {
+          /** @type {AbstractType<any>} */ (right.parent)._map.set(right.parentSub, /** @type {Item} */ (left));
+        }
+        continue
       }
     }
+    break
   }
+  const merged = pos - i;
+  if (merged) {
+    // remove all merged structs from the array
+    structs.splice(pos + 1 - merged, merged);
+  }
+  return merged
 };
 
 /**
@@ -3111,9 +3267,9 @@ const tryMergeDeleteSet = (ds, store) => {
       for (
         let si = mostRightIndexToCheck, struct = structs[si];
         si > 0 && struct.id.clock >= deleteItem.clock;
-        struct = structs[--si]
+        struct = structs[si]
       ) {
-        tryToMergeWithLeft(structs, si);
+        si -= 1 + tryToMergeWithLefts(structs, si);
       }
     }
   });
@@ -3143,7 +3299,6 @@ const cleanupTransactions = (transactionCleanups, i) => {
     try {
       sortAndMergeDeleteSet(ds);
       transaction.afterState = getStateVector(transaction.doc.store);
-      doc._transaction = null;
       doc.emit('beforeObserverCalls', [transaction, doc]);
       /**
        * An array of event callbacks.
@@ -3163,31 +3318,34 @@ const cleanupTransactions = (transactionCleanups, i) => {
       );
       fs.push(() => {
         // deep observe events
-        transaction.changedParentTypes.forEach((events, type) =>
-          fs.push(() => {
-            // We need to think about the possibility that the user transforms the
-            // Y.Doc in the event.
-            if (type._item === null || !type._item.deleted) {
-              events = events
-                .filter(event =>
-                  event.target._item === null || !event.target._item.deleted
-                );
-              events
-                .forEach(event => {
-                  event.currentTarget = type;
-                });
-              // sort events by path length so that top-level events are fired first.
-              events
-                .sort((event1, event2) => event1.path.length - event2.path.length);
-              // We don't need to check for events.length
-              // because we know it has at least one element
-              callEventHandlerListeners(type._dEH, events, transaction);
-            }
-          })
-        );
-        fs.push(() => doc.emit('afterTransaction', [transaction, doc]));
+        transaction.changedParentTypes.forEach((events, type) => {
+          // We need to think about the possibility that the user transforms the
+          // Y.Doc in the event.
+          if (type._dEH.l.length > 0 && (type._item === null || !type._item.deleted)) {
+            events = events
+              .filter(event =>
+                event.target._item === null || !event.target._item.deleted
+              );
+            events
+              .forEach(event => {
+                event.currentTarget = type;
+                // path is relative to the current target
+                event._path = null;
+              });
+            // sort events by path length so that top-level events are fired first.
+            events
+              .sort((event1, event2) => event1.path.length - event2.path.length);
+            // We don't need to check for events.length
+            // because we know it has at least one element
+            callEventHandlerListeners(type._dEH, events, transaction);
+          }
+        });
       });
+      fs.push(() => doc.emit('afterTransaction', [transaction, doc]));
       f.callAll(fs, []);
+      if (transaction._needFormattingCleanup) {
+        cleanupYTextAfterTransaction(transaction);
+      }
     } finally {
       // Replace deleted items with ItemDeleted / GC.
       // This is where content is actually remove from the Yjs Doc.
@@ -3203,23 +3361,25 @@ const cleanupTransactions = (transactionCleanups, i) => {
           const structs = /** @type {Array<GC|Item>} */ (store.clients.get(client));
           // we iterate from right to left so we can safely remove entries
           const firstChangePos = math__namespace.max(findIndexSS(structs, beforeClock), 1);
-          for (let i = structs.length - 1; i >= firstChangePos; i--) {
-            tryToMergeWithLeft(structs, i);
+          for (let i = structs.length - 1; i >= firstChangePos;) {
+            i -= 1 + tryToMergeWithLefts(structs, i);
           }
         }
       });
       // try to merge mergeStructs
       // @todo: it makes more sense to transform mergeStructs to a DS, sort it, and merge from right to left
       //        but at the moment DS does not handle duplicates
-      for (let i = 0; i < mergeStructs.length; i++) {
+      for (let i = mergeStructs.length - 1; i >= 0; i--) {
         const { client, clock } = mergeStructs[i].id;
         const structs = /** @type {Array<GC|Item>} */ (store.clients.get(client));
         const replacedStructPos = findIndexSS(structs, clock);
         if (replacedStructPos + 1 < structs.length) {
-          tryToMergeWithLeft(structs, replacedStructPos + 1);
+          if (tryToMergeWithLefts(structs, replacedStructPos + 1) > 1) {
+            continue // no need to perform next check, both are already merged
+          }
         }
         if (replacedStructPos > 0) {
-          tryToMergeWithLeft(structs, replacedStructPos);
+          tryToMergeWithLefts(structs, replacedStructPos);
         }
       }
       if (!transaction.local && transaction.afterState.get(doc.clientID) !== transaction.beforeState.get(doc.clientID)) {
@@ -3269,15 +3429,21 @@ const cleanupTransactions = (transactionCleanups, i) => {
 /**
  * Implements the functionality of `y.transact(()=>{..})`
  *
+ * @template T
  * @param {Doc} doc
- * @param {function(Transaction):void} f
+ * @param {function(Transaction):T} f
  * @param {any} [origin=true]
+ * @return {T}
  *
  * @function
  */
 const transact = (doc, f, origin = null, local = true) => {
   const transactionCleanups = doc._transactionCleanups;
   let initialCall = false;
+  /**
+   * @type {any}
+   */
+  let result = null;
   if (doc._transaction === null) {
     initialCall = true;
     doc._transaction = new Transaction(doc, origin, local);
@@ -3288,20 +3454,25 @@ const transact = (doc, f, origin = null, local = true) => {
     doc.emit('beforeTransaction', [doc._transaction, doc]);
   }
   try {
-    f(doc._transaction);
+    result = f(doc._transaction);
   } finally {
-    if (initialCall && transactionCleanups[0] === doc._transaction) {
-      // The first transaction ended, now process observer calls.
-      // Observer call may create new transactions for which we need to call the observers and do cleanup.
-      // We don't want to nest these calls, so we execute these calls one after
-      // another.
-      // Also we need to ensure that all cleanups are called, even if the
-      // observes throw errors.
-      // This file is full of hacky try {} finally {} blocks to ensure that an
-      // event can throw errors and also that the cleanup is called.
-      cleanupTransactions(transactionCleanups, 0);
+    if (initialCall) {
+      const finishCleanup = doc._transaction === transactionCleanups[0];
+      doc._transaction = null;
+      if (finishCleanup) {
+        // The first transaction ended, now process observer calls.
+        // Observer call may create new transactions for which we need to call the observers and do cleanup.
+        // We don't want to nest these calls, so we execute these calls one after
+        // another.
+        // Also we need to ensure that all cleanups are called, even if the
+        // observes throw errors.
+        // This file is full of hacky try {} finally {} blocks to ensure that an
+        // event can throw errors and also that the cleanup is called.
+        cleanupTransactions(transactionCleanups, 0);
+      }
     }
   }
+  return result
 };
 
 class StackItem {
@@ -3334,15 +3505,10 @@ const clearUndoManagerStackItem = (tr, um, stackItem) => {
 /**
  * @param {UndoManager} undoManager
  * @param {Array<StackItem>} stack
- * @param {string} eventType
+ * @param {'undo'|'redo'} eventType
  * @return {StackItem?}
  */
 const popStackItem = (undoManager, stack, eventType) => {
-  /**
-   * Whether a change happened
-   * @type {StackItem?}
-   */
-  let result = null;
   /**
    * Keep a reference to the transaction so we can fire the event with the changedParentTypes
    * @type {any}
@@ -3351,7 +3517,7 @@ const popStackItem = (undoManager, stack, eventType) => {
   const doc = undoManager.doc;
   const scope = undoManager.scope;
   transact(doc, transaction => {
-    while (stack.length > 0 && result === null) {
+    while (stack.length > 0 && undoManager.currStackItem === null) {
       const store = doc.store;
       const stackItem = /** @type {StackItem} */ (stack.pop());
       /**
@@ -3388,7 +3554,7 @@ const popStackItem = (undoManager, stack, eventType) => {
         }
       });
       itemsToRedo.forEach(struct => {
-        performedChange = redoItem(transaction, struct, itemsToRedo, stackItem.insertions, undoManager.ignoreRemoteMapChanges) !== null || performedChange;
+        performedChange = redoItem(transaction, struct, itemsToRedo, stackItem.insertions, undoManager.ignoreRemoteMapChanges, undoManager) !== null || performedChange;
       });
       // We want to delete in reverse order so that children are deleted before
       // parents, so we have more information available when items are filtered.
@@ -3399,7 +3565,7 @@ const popStackItem = (undoManager, stack, eventType) => {
           performedChange = true;
         }
       }
-      result = performedChange ? stackItem : null;
+      undoManager.currStackItem = performedChange ? stackItem : null;
     }
     transaction.changed.forEach((subProps, type) => {
       // destroy search marker if necessary
@@ -3409,22 +3575,33 @@ const popStackItem = (undoManager, stack, eventType) => {
     });
     _tr = transaction;
   }, undoManager);
-  if (result != null) {
+  if (undoManager.currStackItem != null) {
     const changedParentTypes = _tr.changedParentTypes;
-    undoManager.emit('stack-item-popped', [{ stackItem: result, type: eventType, changedParentTypes }, undoManager]);
+    undoManager.emit('stack-item-popped', [{ stackItem: undoManager.currStackItem, type: eventType, changedParentTypes, origin: undoManager }, undoManager]);
+    undoManager.currStackItem = null;
   }
-  return result
+  return undoManager.currStackItem
 };
 
 /**
  * @typedef {Object} UndoManagerOptions
  * @property {number} [UndoManagerOptions.captureTimeout=500]
+ * @property {function(Transaction):boolean} [UndoManagerOptions.captureTransaction] Do not capture changes of a Transaction if result false.
  * @property {function(Item):boolean} [UndoManagerOptions.deleteFilter=()=>true] Sometimes
- * it is necessary to filter whan an Undo/Redo operation can delete. If this
+ * it is necessary to filter what an Undo/Redo operation can delete. If this
  * filter returns false, the type/item won't be deleted even it is in the
  * undo/redo scope.
  * @property {Set<any>} [UndoManagerOptions.trackedOrigins=new Set([null])]
  * @property {boolean} [ignoreRemoteMapChanges] Experimental. By default, the UndoManager will never overwrite remote changes. Enable this property to enable overwriting remote changes on key-value changes (Y.Map, properties on Y.Xml, etc..).
+ * @property {Doc} [doc] The document that this UndoManager operates on. Only needed if typeScope is empty.
+ */
+
+/**
+ * @typedef {Object} StackItemEvent
+ * @property {StackItem} StackItemEvent.stackItem
+ * @property {any} StackItemEvent.origin
+ * @property {'undo'|'redo'} StackItemEvent.type
+ * @property {Map<AbstractType<YEvent<any>>,Array<YEvent<any>>>} StackItemEvent.changedParentTypes
  */
 
 /**
@@ -3434,23 +3611,32 @@ const popStackItem = (undoManager, stack, eventType) => {
  * Fires 'stack-item-popped' event when a stack item was popped from either the
  * undo- or the redo-stack. You may restore the saved stack information from `event.stackItem.meta`.
  *
- * @extends {Observable<'stack-item-added'|'stack-item-popped'|'stack-cleared'|'stack-item-updated'>}
+ * @extends {ObservableV2<{'stack-item-added':function(StackItemEvent, UndoManager):void, 'stack-item-popped': function(StackItemEvent, UndoManager):void, 'stack-cleared': function({ undoStackCleared: boolean, redoStackCleared: boolean }):void, 'stack-item-updated': function(StackItemEvent, UndoManager):void }>}
  */
-class UndoManager extends observable.Observable {
+class UndoManager extends observable.ObservableV2 {
   /**
    * @param {AbstractType<any>|Array<AbstractType<any>>} typeScope Accepts either a single type, or an array of types
    * @param {UndoManagerOptions} options
    */
-  constructor (typeScope, { captureTimeout = 500, deleteFilter = () => true, trackedOrigins = new Set([null]), ignoreRemoteMapChanges = false } = {}) {
+  constructor (typeScope, {
+    captureTimeout = 500,
+    captureTransaction = _tr => true,
+    deleteFilter = () => true,
+    trackedOrigins = new Set([null]),
+    ignoreRemoteMapChanges = false,
+    doc = /** @type {Doc} */ (array__namespace.isArray(typeScope) ? typeScope[0].doc : typeScope.doc)
+  } = {}) {
     super();
     /**
      * @type {Array<AbstractType<any>>}
      */
     this.scope = [];
+    this.doc = doc;
     this.addToScope(typeScope);
     this.deleteFilter = deleteFilter;
     trackedOrigins.add(this);
     this.trackedOrigins = trackedOrigins;
+    this.captureTransaction = captureTransaction;
     /**
      * @type {Array<StackItem>}
      */
@@ -3466,15 +3652,25 @@ class UndoManager extends observable.Observable {
      */
     this.undoing = false;
     this.redoing = false;
-    this.doc = /** @type {Doc} */ (this.scope[0].doc);
+    /**
+     * The currently popped stack item if UndoManager.undoing or UndoManager.redoing
+     *
+     * @type {StackItem|null}
+     */
+    this.currStackItem = null;
     this.lastChange = 0;
     this.ignoreRemoteMapChanges = ignoreRemoteMapChanges;
+    this.captureTimeout = captureTimeout;
     /**
      * @param {Transaction} transaction
      */
     this.afterTransactionHandler = transaction => {
       // Only track certain transactions
-      if (!this.scope.some(type => transaction.changedParentTypes.has(type)) || (!this.trackedOrigins.has(transaction.origin) && (!transaction.origin || !this.trackedOrigins.has(transaction.origin.constructor)))) {
+      if (
+        !this.captureTransaction(transaction) ||
+        !this.scope.some(type => transaction.changedParentTypes.has(type)) ||
+        (!this.trackedOrigins.has(transaction.origin) && (!transaction.origin || !this.trackedOrigins.has(transaction.origin.constructor)))
+      ) {
         return
       }
       const undoing = this.undoing;
@@ -3496,7 +3692,7 @@ class UndoManager extends observable.Observable {
       });
       const now = time__namespace.getUnixTime();
       let didAdd = false;
-      if (now - this.lastChange < captureTimeout && stack.length > 0 && !undoing && !redoing) {
+      if (this.lastChange > 0 && now - this.lastChange < this.captureTimeout && stack.length > 0 && !undoing && !redoing) {
         // append change to last stack op
         const lastOp = stack[stack.length - 1];
         lastOp.deletions = mergeDeleteSets([lastOp.deletions, transaction.deleteSet]);
@@ -3515,6 +3711,9 @@ class UndoManager extends observable.Observable {
           keepItem(item, true);
         }
       });
+      /**
+       * @type {[StackItemEvent, UndoManager]}
+       */
       const changeEvent = [{ stackItem: stack[stack.length - 1], origin: transaction.origin, type: undoing ? 'redo' : 'undo', changedParentTypes: transaction.changedParentTypes }, this];
       if (didAdd) {
         this.emit('stack-item-added', changeEvent);
@@ -3535,6 +3734,7 @@ class UndoManager extends observable.Observable {
     ytypes = array__namespace.isArray(ytypes) ? ytypes : [ytypes];
     ytypes.forEach(ytype => {
       if (this.scope.every(yt => yt !== ytype)) {
+        if (ytype.doc !== this.doc) logging__namespace.warn('[yjs#509] Not same Y.Doc'); // use MultiDocUndoManager instead. also see https://github.com/yjs/yjs/issues/509
         this.scope.push(ytype);
       }
     });
@@ -4186,17 +4386,17 @@ const finishLazyStructWriting = (lazyWriter) => {
 
 /**
  * @param {Uint8Array} update
+ * @param {function(Item|GC|Skip):Item|GC|Skip} blockTransformer
  * @param {typeof UpdateDecoderV2 | typeof UpdateDecoderV1} YDecoder
  * @param {typeof UpdateEncoderV2 | typeof UpdateEncoderV1 } YEncoder
  */
-const convertUpdateFormat = (update, YDecoder, YEncoder) => {
+const convertUpdateFormat = (update, blockTransformer, YDecoder, YEncoder) => {
   const updateDecoder = new YDecoder(decoding__namespace.createDecoder(update));
   const lazyDecoder = new LazyStructReader(updateDecoder, false);
   const updateEncoder = new YEncoder();
   const lazyWriter = new LazyStructWriter(updateEncoder);
-
   for (let curr = lazyDecoder.curr; curr !== null; curr = lazyDecoder.next()) {
-    writeStructToLazyStructWriter(lazyWriter, curr, 0);
+    writeStructToLazyStructWriter(lazyWriter, blockTransformer(curr), 0);
   }
   finishLazyStructWriting(lazyWriter);
   const ds = readDeleteSet(updateDecoder);
@@ -4205,14 +4405,137 @@ const convertUpdateFormat = (update, YDecoder, YEncoder) => {
 };
 
 /**
- * @param {Uint8Array} update
+ * @typedef {Object} ObfuscatorOptions
+ * @property {boolean} [ObfuscatorOptions.formatting=true]
+ * @property {boolean} [ObfuscatorOptions.subdocs=true]
+ * @property {boolean} [ObfuscatorOptions.yxml=true] Whether to obfuscate nodeName / hookName
  */
-const convertUpdateFormatV1ToV2 = update => convertUpdateFormat(update, UpdateDecoderV1, UpdateEncoderV2);
+
+/**
+ * @param {ObfuscatorOptions} obfuscator
+ */
+const createObfuscator = ({ formatting = true, subdocs = true, yxml = true } = {}) => {
+  let i = 0;
+  const mapKeyCache = map__namespace.create();
+  const nodeNameCache = map__namespace.create();
+  const formattingKeyCache = map__namespace.create();
+  const formattingValueCache = map__namespace.create();
+  formattingValueCache.set(null, null); // end of a formatting range should always be the end of a formatting range
+  /**
+   * @param {Item|GC|Skip} block
+   * @return {Item|GC|Skip}
+   */
+  return block => {
+    switch (block.constructor) {
+      case GC:
+      case Skip:
+        return block
+      case Item: {
+        const item = /** @type {Item} */ (block);
+        const content = item.content;
+        switch (content.constructor) {
+          case ContentDeleted:
+            break
+          case ContentType: {
+            if (yxml) {
+              const type = /** @type {ContentType} */ (content).type;
+              if (type instanceof YXmlElement) {
+                type.nodeName = map__namespace.setIfUndefined(nodeNameCache, type.nodeName, () => 'node-' + i);
+              }
+              if (type instanceof YXmlHook) {
+                type.hookName = map__namespace.setIfUndefined(nodeNameCache, type.hookName, () => 'hook-' + i);
+              }
+            }
+            break
+          }
+          case ContentAny: {
+            const c = /** @type {ContentAny} */ (content);
+            c.arr = c.arr.map(() => i);
+            break
+          }
+          case ContentBinary: {
+            const c = /** @type {ContentBinary} */ (content);
+            c.content = new Uint8Array([i]);
+            break
+          }
+          case ContentDoc: {
+            const c = /** @type {ContentDoc} */ (content);
+            if (subdocs) {
+              c.opts = {};
+              c.doc.guid = i + '';
+            }
+            break
+          }
+          case ContentEmbed: {
+            const c = /** @type {ContentEmbed} */ (content);
+            c.embed = {};
+            break
+          }
+          case ContentFormat: {
+            const c = /** @type {ContentFormat} */ (content);
+            if (formatting) {
+              c.key = map__namespace.setIfUndefined(formattingKeyCache, c.key, () => i + '');
+              c.value = map__namespace.setIfUndefined(formattingValueCache, c.value, () => ({ i }));
+            }
+            break
+          }
+          case ContentJSON: {
+            const c = /** @type {ContentJSON} */ (content);
+            c.arr = c.arr.map(() => i);
+            break
+          }
+          case ContentString: {
+            const c = /** @type {ContentString} */ (content);
+            c.str = string__namespace.repeat((i % 10) + '', c.str.length);
+            break
+          }
+          default:
+            // unknown content type
+            error__namespace.unexpectedCase();
+        }
+        if (item.parentSub) {
+          item.parentSub = map__namespace.setIfUndefined(mapKeyCache, item.parentSub, () => i + '');
+        }
+        i++;
+        return block
+      }
+      default:
+        // unknown block-type
+        error__namespace.unexpectedCase();
+    }
+  }
+};
+
+/**
+ * This function obfuscates the content of a Yjs update. This is useful to share
+ * buggy Yjs documents while significantly limiting the possibility that a
+ * developer can on the user. Note that it might still be possible to deduce
+ * some information by analyzing the "structure" of the document or by analyzing
+ * the typing behavior using the CRDT-related metadata that is still kept fully
+ * intact.
+ *
+ * @param {Uint8Array} update
+ * @param {ObfuscatorOptions} [opts]
+ */
+const obfuscateUpdate = (update, opts) => convertUpdateFormat(update, createObfuscator(opts), UpdateDecoderV1, UpdateEncoderV1);
+
+/**
+ * @param {Uint8Array} update
+ * @param {ObfuscatorOptions} [opts]
+ */
+const obfuscateUpdateV2 = (update, opts) => convertUpdateFormat(update, createObfuscator(opts), UpdateDecoderV2, UpdateEncoderV2);
 
 /**
  * @param {Uint8Array} update
  */
-const convertUpdateFormatV2ToV1 = update => convertUpdateFormat(update, UpdateDecoderV2, UpdateEncoderV1);
+const convertUpdateFormatV1ToV2 = update => convertUpdateFormat(update, f__namespace.id, UpdateDecoderV1, UpdateEncoderV2);
+
+/**
+ * @param {Uint8Array} update
+ */
+const convertUpdateFormatV2ToV1 = update => convertUpdateFormat(update, f__namespace.id, UpdateDecoderV2, UpdateEncoderV1);
+
+const errorComputeChanges = 'You must not compute changes after the event-handler fired.';
 
 /**
  * @template {AbstractType<any>} T
@@ -4251,6 +4574,10 @@ class YEvent {
      * @type {null | Array<{ insert?: string | Array<any> | object | AbstractType<any>, retain?: number, delete?: number, attributes?: Object<string, any> }>}
      */
     this._delta = null;
+    /**
+     * @type {Array<string|number>|null}
+     */
+    this._path = null;
   }
 
   /**
@@ -4267,8 +4594,7 @@ class YEvent {
    *   type === event.target // => true
    */
   get path () {
-    // @ts-ignore _item is defined because target is integrated
-    return getPathTo(this.currentTarget, this.target)
+    return this._path || (this._path = getPathTo(this.currentTarget, this.target))
   }
 
   /**
@@ -4288,6 +4614,9 @@ class YEvent {
    */
   get keys () {
     if (this._keys === null) {
+      if (this.transaction.doc._transactionCleanups.length === 0) {
+        throw error__namespace.create(errorComputeChanges)
+      }
       const keys = new Map();
       const target = this.target;
       const changed = /** @type Set<string|null> */ (this.transaction.changed.get(target));
@@ -4337,6 +4666,11 @@ class YEvent {
   }
 
   /**
+   * This is a computed property. Note that this can only be safely computed during the
+   * event call. Computing this property after other changes happened might result in
+   * unexpected behavior (incorrect computation of deltas). A safe way to collect changes
+   * is to store the `changes` or the `delta` object. Avoid storing the `transaction` object.
+   *
    * @type {Array<{insert?: string | Array<any> | object | AbstractType<any>, retain?: number, delete?: number, attributes?: Object<string, any>}>}
    */
   get delta () {
@@ -4356,11 +4690,19 @@ class YEvent {
   }
 
   /**
+   * This is a computed property. Note that this can only be safely computed during the
+   * event call. Computing this property after other changes happened might result in
+   * unexpected behavior (incorrect computation of deltas). A safe way to collect changes
+   * is to store the `changes` or the `delta` object. Avoid storing the `transaction` object.
+   *
    * @type {{added:Set<Item>,deleted:Set<Item>,keys:Map<string,{action:'add'|'update'|'delete',oldValue:any}>,delta:Array<{insert?:Array<any>|string, delete?:number, retain?:number}>}}
    */
   get changes () {
     let changes = this._changes;
     if (changes === null) {
+      if (this.transaction.doc._transactionCleanups.length === 0) {
+        throw error__namespace.create(errorComputeChanges)
+      }
       const target = this.target;
       const added = set__namespace.create();
       const deleted = set__namespace.create();
@@ -4760,6 +5102,10 @@ class AbstractType {
   }
 
   /**
+   * Makes a copy of this data type that can be included somewhere else.
+   *
+   * Note that the content is only readable _after_ it has been included somewhere in the Ydoc.
+   *
    * @return {AbstractType<EventType>}
    */
   clone () {
@@ -4767,9 +5113,9 @@ class AbstractType {
   }
 
   /**
-   * @param {UpdateEncoderV1 | UpdateEncoderV2} encoder
+   * @param {UpdateEncoderV1 | UpdateEncoderV2} _encoder
    */
-  _write (encoder) { }
+  _write (_encoder) { }
 
   /**
    * The first non-deleted item
@@ -4787,9 +5133,9 @@ class AbstractType {
    * Must be implemented by each type.
    *
    * @param {Transaction} transaction
-   * @param {Set<null|string>} parentSubs Keys changed on this type. `null` if list was modified.
+   * @param {Set<null|string>} _parentSubs Keys changed on this type. `null` if list was modified.
    */
-  _callObserver (transaction, parentSubs) {
+  _callObserver (transaction, _parentSubs) {
     if (!transaction.local && this._searchMarker) {
       this._searchMarker.length = 0;
     }
@@ -4921,7 +5267,7 @@ const typeListToArraySnapshot = (type, snapshot) => {
 };
 
 /**
- * Executes a provided function on once on overy element of this YArray.
+ * Executes a provided function on once on every element of this YArray.
  *
  * @param {AbstractType<any>} type
  * @param {function(any,number,any):void} f A function to execute on every element of this YArray.
@@ -5101,7 +5447,7 @@ const typeListInsertGenericsAfter = (transaction, parent, referenceItem, content
   packJsonContent();
 };
 
-const lengthExceeded = error__namespace.create('Length exceeded!');
+const lengthExceeded = () => error__namespace.create('Length exceeded!');
 
 /**
  * @param {Transaction} transaction
@@ -5114,7 +5460,7 @@ const lengthExceeded = error__namespace.create('Length exceeded!');
  */
 const typeListInsertGenerics = (transaction, parent, index, content) => {
   if (index > parent._length) {
-    throw lengthExceeded
+    throw lengthExceeded()
   }
   if (index === 0) {
     if (parent._searchMarker) {
@@ -5216,7 +5562,7 @@ const typeListDelete = (transaction, parent, index, length) => {
     n = n.right;
   }
   if (length > 0) {
-    throw lengthExceeded
+    throw lengthExceeded()
   }
   if (parent._searchMarker) {
     updateMarkerChanges(parent._searchMarker, startIndex, -startLength + length /* in case we remove the above exception */);
@@ -5344,6 +5690,34 @@ const typeMapGetSnapshot = (parent, key, snapshot) => {
 };
 
 /**
+ * @param {AbstractType<any>} parent
+ * @param {Snapshot} snapshot
+ * @return {Object<string,Object<string,any>|number|null|Array<any>|string|Uint8Array|AbstractType<any>|undefined>}
+ *
+ * @private
+ * @function
+ */
+const typeMapGetAllSnapshot = (parent, snapshot) => {
+  /**
+   * @type {Object<string,any>}
+   */
+  const res = {};
+  parent._map.forEach((value, key) => {
+    /**
+     * @type {Item|null}
+     */
+    let v = value;
+    while (v !== null && (!snapshot.sv.has(v.id.client) || v.id.clock >= (snapshot.sv.get(v.id.client) || 0))) {
+      v = v.left;
+    }
+    if (v !== null && isVisible$1(v, snapshot)) {
+      res[key] = v.content.getContent()[v.length - 1];
+    }
+  });
+  return res
+};
+
+/**
  * @param {Map<string,Item>} map
  * @return {IterableIterator<Array<any>>}
  *
@@ -5355,6 +5729,7 @@ const createMapIterator = map => iterator__namespace.iteratorFilter(map.entries(
 /**
  * @module YArray
  */
+
 
 /**
  * Event that describes the changes on a YArray
@@ -5394,11 +5769,14 @@ class YArray extends AbstractType {
 
   /**
    * Construct a new YArray containing the specified items.
-   * @template T
+   * @template {Object<string,any>|Array<any>|number|null|string|Uint8Array} T
    * @param {Array<T>} items
    * @return {YArray<T>}
    */
   static from (items) {
+    /**
+     * @type {YArray<T>}
+     */
     const a = new YArray();
     a.push(items);
     return a
@@ -5420,17 +5798,27 @@ class YArray extends AbstractType {
     this._prelimContent = null;
   }
 
+  /**
+   * @return {YArray<T>}
+   */
   _copy () {
     return new YArray()
   }
 
   /**
+   * Makes a copy of this data type that can be included somewhere else.
+   *
+   * Note that the content is only readable _after_ it has been included somewhere in the Ydoc.
+   *
    * @return {YArray<T>}
    */
   clone () {
+    /**
+     * @type {YArray<T>}
+     */
     const arr = new YArray();
     arr.insert(0, this.toArray().map(el =>
-      el instanceof AbstractType ? el.clone() : el
+      el instanceof AbstractType ? /** @type {typeof el} */ (el.clone()) : el
     ));
     return arr
   }
@@ -5469,7 +5857,7 @@ class YArray extends AbstractType {
   insert (index, content) {
     if (this.doc !== null) {
       transact(this.doc, transaction => {
-        typeListInsertGenerics(transaction, this, index, content);
+        typeListInsertGenerics(transaction, this, index, /** @type {any} */ (content));
       });
     } else {
       /** @type {Array<any>} */ (this._prelimContent).splice(index, 0, ...content);
@@ -5486,7 +5874,7 @@ class YArray extends AbstractType {
   push (content) {
     if (this.doc !== null) {
       transact(this.doc, transaction => {
-        typeListPushGenerics(transaction, this, content);
+        typeListPushGenerics(transaction, this, /** @type {any} */ (content));
       });
     } else {
       /** @type {Array<any>} */ (this._prelimContent).push(...content);
@@ -5571,7 +5959,7 @@ class YArray extends AbstractType {
   }
 
   /**
-   * Executes a provided function on once on overy element of this YArray.
+   * Executes a provided function once on every element of this YArray.
    *
    * @param {function(T,number,YArray<T>):void} f A function to execute on every element of this YArray.
    */
@@ -5595,12 +5983,17 @@ class YArray extends AbstractType {
 }
 
 /**
- * @param {UpdateDecoderV1 | UpdateDecoderV2} decoder
+ * @param {UpdateDecoderV1 | UpdateDecoderV2} _decoder
  *
  * @private
  * @function
  */
-const readYArray = decoder => new YArray();
+const readYArray = _decoder => new YArray();
+
+/**
+ * @module YMap
+ */
+
 
 /**
  * @template T
@@ -5624,7 +6017,7 @@ class YMapEvent extends YEvent {
  * A shared Map implementation.
  *
  * @extends AbstractType<YMapEvent<MapType>>
- * @implements {Iterable<MapType>}
+ * @implements {Iterable<[string, MapType]>}
  */
 class YMap extends AbstractType {
   /**
@@ -5664,17 +6057,27 @@ class YMap extends AbstractType {
     this._prelimContent = null;
   }
 
+  /**
+   * @return {YMap<MapType>}
+   */
   _copy () {
     return new YMap()
   }
 
   /**
+   * Makes a copy of this data type that can be included somewhere else.
+   *
+   * Note that the content is only readable _after_ it has been included somewhere in the Ydoc.
+   *
    * @return {YMap<MapType>}
    */
   clone () {
+    /**
+     * @type {YMap<MapType>}
+     */
     const map = new YMap();
     this.forEach((value, key) => {
-      map.set(key, value instanceof AbstractType ? value.clone() : value);
+      map.set(key, value instanceof AbstractType ? /** @type {typeof value} */ (value.clone()) : value);
     });
     return map
   }
@@ -5729,7 +6132,7 @@ class YMap extends AbstractType {
   /**
    * Returns the values for each element in the YMap Type.
    *
-   * @return {IterableIterator<any>}
+   * @return {IterableIterator<MapType>}
    */
   values () {
     return iterator__namespace.iteratorMap(createMapIterator(this._map), /** @param {any} v */ v => v[1].content.getContent()[v[1].length - 1])
@@ -5738,10 +6141,10 @@ class YMap extends AbstractType {
   /**
    * Returns an Iterator of [key, value] pairs
    *
-   * @return {IterableIterator<any>}
+   * @return {IterableIterator<[string, MapType]>}
    */
   entries () {
-    return iterator__namespace.iteratorMap(createMapIterator(this._map), /** @param {any} v */ v => [v[0], v[1].content.getContent()[v[1].length - 1]])
+    return iterator__namespace.iteratorMap(createMapIterator(this._map), /** @param {any} v */ v => /** @type {any} */ ([v[0], v[1].content.getContent()[v[1].length - 1]]))
   }
 
   /**
@@ -5750,20 +6153,17 @@ class YMap extends AbstractType {
    * @param {function(MapType,string,YMap<MapType>):void} f A function to execute on every element of this YArray.
    */
   forEach (f) {
-    /**
-     * @type {Object<string,MapType>}
-     */
-    const map = {};
     this._map.forEach((item, key) => {
       if (!item.deleted) {
         f(item.content.getContent()[item.length - 1], key, this);
       }
     });
-    return map
   }
 
   /**
-   * @return {IterableIterator<MapType>}
+   * Returns an Iterator of [key, value] pairs
+   *
+   * @return {IterableIterator<[string, MapType]>}
    */
   [Symbol.iterator] () {
     return this.entries()
@@ -5786,14 +6186,16 @@ class YMap extends AbstractType {
 
   /**
    * Adds or updates an element with a specified key and value.
+   * @template {MapType} VAL
    *
    * @param {string} key The key of the element to add to this YMap
-   * @param {MapType} value The value of the element to add
+   * @param {VAL} value The value of the element to add
+   * @return {VAL}
    */
   set (key, value) {
     if (this.doc !== null) {
       transact(this.doc, transaction => {
-        typeMapSet(transaction, this, key, value);
+        typeMapSet(transaction, this, key, /** @type {any} */ (value));
       });
     } else {
       /** @type {Map<string, any>} */ (this._prelimContent).set(key, value);
@@ -5827,7 +6229,7 @@ class YMap extends AbstractType {
   clear () {
     if (this.doc !== null) {
       transact(this.doc, transaction => {
-        this.forEach(function (value, key, map) {
+        this.forEach(function (_value, key, map) {
           typeMapDelete(transaction, map, key);
         });
       });
@@ -5845,12 +6247,17 @@ class YMap extends AbstractType {
 }
 
 /**
- * @param {UpdateDecoderV1 | UpdateDecoderV2} decoder
+ * @param {UpdateDecoderV1 | UpdateDecoderV2} _decoder
  *
  * @private
  * @function
  */
-const readYMap = decoder => new YMap();
+const readYMap = _decoder => new YMap();
+
+/**
+ * @module YText
+ */
+
 
 /**
  * @param {any} a
@@ -5936,14 +6343,15 @@ const findNextPosition = (transaction, pos, count) => {
  * @param {Transaction} transaction
  * @param {AbstractType<any>} parent
  * @param {number} index
+ * @param {boolean} useSearchMarker
  * @return {ItemTextListPosition}
  *
  * @private
  * @function
  */
-const findPosition = (transaction, parent, index) => {
+const findPosition = (transaction, parent, index, useSearchMarker) => {
   const currentAttributes = new Map();
-  const marker = findMarker(parent, index);
+  const marker = useSearchMarker ? findMarker(parent, index) : null;
   if (marker) {
     const pos = new ItemTextListPosition(marker.p.left, marker.p, marker.index, currentAttributes);
     return findNextPosition(transaction, pos, index - marker.index)
@@ -6019,7 +6427,7 @@ const minimizeAttributeChanges = (currPos, attributes) => {
   while (true) {
     if (currPos.right === null) {
       break
-    } else if (currPos.right.deleted || (currPos.right.content.constructor === ContentFormat && equalAttrs$1(attributes[(/** @type {ContentFormat} */ (currPos.right.content)).key] || null, /** @type {ContentFormat} */ (currPos.right.content).value))) ; else {
+    } else if (currPos.right.deleted || (currPos.right.content.constructor === ContentFormat && equalAttrs$1(attributes[(/** @type {ContentFormat} */ (currPos.right.content)).key] ?? null, /** @type {ContentFormat} */ (currPos.right.content).value))) ; else {
       break
     }
     currPos.forward();
@@ -6043,7 +6451,7 @@ const insertAttributes = (transaction, parent, currPos, attributes) => {
   // insert format-start items
   for (const key in attributes) {
     const val = attributes[key];
-    const currentVal = currPos.currentAttributes.get(key) || null;
+    const currentVal = currPos.currentAttributes.get(key) ?? null;
     if (!equalAttrs$1(currentVal, val)) {
       // save negated attribute (set null if currentVal undefined)
       negatedAttributes.set(key, currentVal);
@@ -6067,7 +6475,7 @@ const insertAttributes = (transaction, parent, currPos, attributes) => {
  * @function
  **/
 const insertText = (transaction, parent, currPos, text, attributes) => {
-  currPos.currentAttributes.forEach((val, key) => {
+  currPos.currentAttributes.forEach((_val, key) => {
     if (attributes[key] === undefined) {
       attributes[key] = null;
     }
@@ -6108,7 +6516,16 @@ const formatText = (transaction, parent, currPos, length, attributes) => {
   // iterate until first non-format or null is found
   // delete all formats with attributes[format.key] != null
   // also check the attributes after the first non-format as we do not want to insert redundant negated attributes there
-  while (currPos.right !== null && (length > 0 || currPos.right.content.constructor === ContentFormat)) {
+  // eslint-disable-next-line no-labels
+  iterationLoop: while (
+    currPos.right !== null &&
+    (length > 0 ||
+      (
+        negatedAttributes.size > 0 &&
+        (currPos.right.deleted || currPos.right.content.constructor === ContentFormat)
+      )
+    )
+  ) {
     if (!currPos.right.deleted) {
       switch (currPos.right.content.constructor) {
         case ContentFormat: {
@@ -6118,9 +6535,16 @@ const formatText = (transaction, parent, currPos, length, attributes) => {
             if (equalAttrs$1(attr, value)) {
               negatedAttributes.delete(key);
             } else {
+              if (length === 0) {
+                // no need to further extend negatedAttributes
+                // eslint-disable-next-line no-labels
+                break iterationLoop
+              }
               negatedAttributes.set(key, value);
             }
             currPos.right.delete(transaction);
+          } else {
+            currPos.currentAttributes.set(key, value);
           }
           break
         }
@@ -6163,32 +6587,47 @@ const formatText = (transaction, parent, currPos, length, attributes) => {
  * @function
  */
 const cleanupFormattingGap = (transaction, start, curr, startAttributes, currAttributes) => {
-  let end = curr;
-  const endAttributes = map__namespace.copy(currAttributes);
+  /**
+   * @type {Item|null}
+   */
+  let end = start;
+  /**
+   * @type {Map<string,ContentFormat>}
+   */
+  const endFormats = map__namespace.create();
   while (end && (!end.countable || end.deleted)) {
     if (!end.deleted && end.content.constructor === ContentFormat) {
-      updateCurrentAttributes(endAttributes, /** @type {ContentFormat} */ (end.content));
+      const cf = /** @type {ContentFormat} */ (end.content);
+      endFormats.set(cf.key, cf);
     }
     end = end.right;
   }
   let cleanups = 0;
-  let reachedEndOfCurr = false;
+  let reachedCurr = false;
   while (start !== end) {
     if (curr === start) {
-      reachedEndOfCurr = true;
+      reachedCurr = true;
     }
     if (!start.deleted) {
       const content = start.content;
       switch (content.constructor) {
         case ContentFormat: {
           const { key, value } = /** @type {ContentFormat} */ (content);
-          if ((endAttributes.get(key) || null) !== value || (startAttributes.get(key) || null) === value) {
+          const startAttrValue = startAttributes.get(key) ?? null;
+          if (endFormats.get(key) !== content || startAttrValue === value) {
             // Either this format is overwritten or it is not necessary because the attribute already existed.
             start.delete(transaction);
             cleanups++;
-            if (!reachedEndOfCurr && (currAttributes.get(key) || null) === value && (startAttributes.get(key) || null) !== value) {
-              currAttributes.delete(key);
+            if (!reachedCurr && (currAttributes.get(key) ?? null) === value && startAttrValue !== value) {
+              if (startAttrValue === null) {
+                currAttributes.delete(key);
+              } else {
+                currAttributes.set(key, startAttrValue);
+              }
             }
+          }
+          if (!reachedCurr && !start.deleted) {
+            updateCurrentAttributes(currAttributes, /** @type {ContentFormat} */ (content));
           }
           break
         }
@@ -6259,6 +6698,56 @@ const cleanupYTextFormatting = type => {
     }
   });
   return res
+};
+
+/**
+ * This will be called by the transction once the event handlers are called to potentially cleanup
+ * formatting attributes.
+ *
+ * @param {Transaction} transaction
+ */
+const cleanupYTextAfterTransaction = transaction => {
+  /**
+   * @type {Set<YText>}
+   */
+  const needFullCleanup = new Set();
+  // check if another formatting item was inserted
+  const doc = transaction.doc;
+  for (const [client, afterClock] of transaction.afterState.entries()) {
+    const clock = transaction.beforeState.get(client) || 0;
+    if (afterClock === clock) {
+      continue
+    }
+    iterateStructs(transaction, /** @type {Array<Item|GC>} */ (doc.store.clients.get(client)), clock, afterClock, item => {
+      if (
+        !item.deleted && /** @type {Item} */ (item).content.constructor === ContentFormat && item.constructor !== GC
+      ) {
+        needFullCleanup.add(/** @type {any} */ (item).parent);
+      }
+    });
+  }
+  // cleanup in a new transaction
+  transact(doc, (t) => {
+    iterateDeletedStructs(transaction, transaction.deleteSet, item => {
+      if (item instanceof GC || !(/** @type {YText} */ (item.parent)._hasFormatting) || needFullCleanup.has(/** @type {YText} */ (item.parent))) {
+        return
+      }
+      const parent = /** @type {YText} */ (item.parent);
+      if (item.content.constructor === ContentFormat) {
+        needFullCleanup.add(parent);
+      } else {
+        // If no formatting attribute was inserted or deleted, we can make due with contextless
+        // formatting cleanups.
+        // Contextless: it is not necessary to compute currentAttributes for the affected position.
+        cleanupContextlessFormattingGap(t, item);
+      }
+    });
+    // If a formatting item was inserted, we simply clean the whole type.
+    // We need to compute currentAttributes for the current position anyway.
+    for (const yText of needFullCleanup) {
+      cleanupYTextFormatting(yText);
+    }
+  });
 };
 
 /**
@@ -6416,36 +6905,39 @@ class YTextEvent extends YEvent {
             /**
              * @type {any}
              */
-            let op;
+            let op = null;
             switch (action) {
               case 'delete':
-                op = { delete: deleteLen };
+                if (deleteLen > 0) {
+                  op = { delete: deleteLen };
+                }
                 deleteLen = 0;
                 break
               case 'insert':
-                op = { insert };
-                if (currentAttributes.size > 0) {
-                  op.attributes = {};
-                  currentAttributes.forEach((value, key) => {
-                    if (value !== null) {
-                      op.attributes[key] = value;
-                    }
-                  });
+                if (typeof insert === 'object' || insert.length > 0) {
+                  op = { insert };
+                  if (currentAttributes.size > 0) {
+                    op.attributes = {};
+                    currentAttributes.forEach((value, key) => {
+                      if (value !== null) {
+                        op.attributes[key] = value;
+                      }
+                    });
+                  }
                 }
                 insert = '';
                 break
               case 'retain':
-                op = { retain };
-                if (Object.keys(attributes).length > 0) {
-                  op.attributes = {};
-                  for (const key in attributes) {
-                    op.attributes[key] = attributes[key];
+                if (retain > 0) {
+                  op = { retain };
+                  if (!object__namespace.isEmpty(attributes)) {
+                    op.attributes = object__namespace.assign({}, attributes);
                   }
                 }
                 retain = 0;
                 break
             }
-            delta.push(op);
+            if (op) delta.push(op);
             action = null;
           }
         };
@@ -6501,12 +6993,12 @@ class YTextEvent extends YEvent {
               const { key, value } = /** @type {ContentFormat} */ (item.content);
               if (this.adds(item)) {
                 if (!this.deletes(item)) {
-                  const curVal = currentAttributes.get(key) || null;
+                  const curVal = currentAttributes.get(key) ?? null;
                   if (!equalAttrs$1(curVal, value)) {
                     if (action === 'retain') {
                       addOp();
                     }
-                    if (equalAttrs$1(value, (oldAttributes.get(key) || null))) {
+                    if (equalAttrs$1(value, (oldAttributes.get(key) ?? null))) {
                       delete attributes[key];
                     } else {
                       attributes[key] = value;
@@ -6517,7 +7009,7 @@ class YTextEvent extends YEvent {
                 }
               } else if (this.deletes(item)) {
                 oldAttributes.set(key, value);
-                const curVal = currentAttributes.get(key) || null;
+                const curVal = currentAttributes.get(key) ?? null;
                 if (!equalAttrs$1(curVal, value)) {
                   if (action === 'retain') {
                     addOp();
@@ -6591,9 +7083,14 @@ class YText extends AbstractType {
      */
     this._pending = string !== undefined ? [() => this.insert(0, string)] : [];
     /**
-     * @type {Array<ArraySearchMarker>}
+     * @type {Array<ArraySearchMarker>|null}
      */
     this._searchMarker = [];
+    /**
+     * Whether this YText contains formatting attributes.
+     * This flag is updated when a formatting item is integrated (see ContentFormat.integrate)
+     */
+    this._hasFormatting = false;
   }
 
   /**
@@ -6624,6 +7121,10 @@ class YText extends AbstractType {
   }
 
   /**
+   * Makes a copy of this data type that can be included somewhere else.
+   *
+   * Note that the content is only readable _after_ it has been included somewhere in the Ydoc.
+   *
    * @return {YText}
    */
   clone () {
@@ -6641,55 +7142,10 @@ class YText extends AbstractType {
   _callObserver (transaction, parentSubs) {
     super._callObserver(transaction, parentSubs);
     const event = new YTextEvent(this, transaction, parentSubs);
-    const doc = transaction.doc;
     callTypeObservers(this, transaction, event);
     // If a remote change happened, we try to cleanup potential formatting duplicates.
-    if (!transaction.local) {
-      // check if another formatting item was inserted
-      let foundFormattingItem = false;
-      for (const [client, afterClock] of transaction.afterState.entries()) {
-        const clock = transaction.beforeState.get(client) || 0;
-        if (afterClock === clock) {
-          continue
-        }
-        iterateStructs(transaction, /** @type {Array<Item|GC>} */ (doc.store.clients.get(client)), clock, afterClock, item => {
-          if (!item.deleted && /** @type {Item} */ (item).content.constructor === ContentFormat) {
-            foundFormattingItem = true;
-          }
-        });
-        if (foundFormattingItem) {
-          break
-        }
-      }
-      if (!foundFormattingItem) {
-        iterateDeletedStructs(transaction, transaction.deleteSet, item => {
-          if (item instanceof GC || foundFormattingItem) {
-            return
-          }
-          if (item.parent === this && item.content.constructor === ContentFormat) {
-            foundFormattingItem = true;
-          }
-        });
-      }
-      transact(doc, (t) => {
-        if (foundFormattingItem) {
-          // If a formatting item was inserted, we simply clean the whole type.
-          // We need to compute currentAttributes for the current position anyway.
-          cleanupYTextFormatting(this);
-        } else {
-          // If no formatting attribute was inserted, we can make due with contextless
-          // formatting cleanups.
-          // Contextless: it is not necessary to compute currentAttributes for the affected position.
-          iterateDeletedStructs(t, t.deleteSet, item => {
-            if (item instanceof GC) {
-              return
-            }
-            if (item.parent === this) {
-              cleanupContextlessFormattingGap(t, item);
-            }
-          });
-        }
-      });
+    if (!transaction.local && this._hasFormatting) {
+      transaction._needFormattingCleanup = true;
     }
   }
 
@@ -6727,7 +7183,7 @@ class YText extends AbstractType {
    * Apply a {@link Delta} on this shared YText type.
    *
    * @param {any} delta The changes to apply on this element.
-   * @param {object}  [opts]
+   * @param {object}  opts
    * @param {boolean} [opts.sanitize] Sanitize input delta. Removes ending newlines if set to true.
    *
    *
@@ -6803,27 +7259,19 @@ class YText extends AbstractType {
         str = '';
       }
     }
-    // snapshots are merged again after the transaction, so we need to keep the
-    // transalive until we are done
-    transact(doc, transaction => {
-      if (snapshot) {
-        splitSnapshotAffectedStructs(transaction, snapshot);
-      }
-      if (prevSnapshot) {
-        splitSnapshotAffectedStructs(transaction, prevSnapshot);
-      }
+    const computeDelta = () => {
       while (n !== null) {
         if (isVisible$1(n, snapshot) || (prevSnapshot !== undefined && isVisible$1(n, prevSnapshot))) {
           switch (n.content.constructor) {
             case ContentString: {
               const cur = currentAttributes.get('ychange');
               if (snapshot !== undefined && !isVisible$1(n, snapshot)) {
-                if (cur === undefined || cur.user !== n.id.client || cur.state !== 'removed') {
+                if (cur === undefined || cur.user !== n.id.client || cur.type !== 'removed') {
                   packStr();
                   currentAttributes.set('ychange', computeYChange ? computeYChange('removed', n.id) : { type: 'removed' });
                 }
               } else if (prevSnapshot !== undefined && !isVisible$1(n, prevSnapshot)) {
-                if (cur === undefined || cur.user !== n.id.client || cur.state !== 'added') {
+                if (cur === undefined || cur.user !== n.id.client || cur.type !== 'added') {
                   packStr();
                   currentAttributes.set('ychange', computeYChange ? computeYChange('added', n.id) : { type: 'added' });
                 }
@@ -6864,7 +7312,22 @@ class YText extends AbstractType {
         n = n.right;
       }
       packStr();
-    }, splitSnapshotAffectedStructs);
+    };
+    if (snapshot || prevSnapshot) {
+      // snapshots are merged again after the transaction, so we need to keep the
+      // transaction alive until we are done
+      transact(doc, transaction => {
+        if (snapshot) {
+          splitSnapshotAffectedStructs(transaction, snapshot);
+        }
+        if (prevSnapshot) {
+          splitSnapshotAffectedStructs(transaction, prevSnapshot);
+        }
+        computeDelta();
+      }, 'cleanup');
+    } else {
+      computeDelta();
+    }
     return ops
   }
 
@@ -6885,7 +7348,7 @@ class YText extends AbstractType {
     const y = this.doc;
     if (y !== null) {
       transact(y, transaction => {
-        const pos = findPosition(transaction, this, index);
+        const pos = findPosition(transaction, this, index, !attributes);
         if (!attributes) {
           attributes = {};
           // @ts-ignore
@@ -6903,20 +7366,20 @@ class YText extends AbstractType {
    *
    * @param {number} index The index to insert the embed at.
    * @param {Object | AbstractType<any>} embed The Object that represents the embed.
-   * @param {TextAttributes} attributes Attribute information to apply on the
+   * @param {TextAttributes} [attributes] Attribute information to apply on the
    *                                    embed
    *
    * @public
    */
-  insertEmbed (index, embed, attributes = {}) {
+  insertEmbed (index, embed, attributes) {
     const y = this.doc;
     if (y !== null) {
       transact(y, transaction => {
-        const pos = findPosition(transaction, this, index);
-        insertText(transaction, this, pos, embed, attributes);
+        const pos = findPosition(transaction, this, index, !attributes);
+        insertText(transaction, this, pos, embed, attributes || {});
       });
     } else {
-      /** @type {Array<function>} */ (this._pending).push(() => this.insertEmbed(index, embed, attributes));
+      /** @type {Array<function>} */ (this._pending).push(() => this.insertEmbed(index, embed, attributes || {}));
     }
   }
 
@@ -6935,7 +7398,7 @@ class YText extends AbstractType {
     const y = this.doc;
     if (y !== null) {
       transact(y, transaction => {
-        deleteText(transaction, findPosition(transaction, this, index), length);
+        deleteText(transaction, findPosition(transaction, this, index, true), length);
       });
     } else {
       /** @type {Array<function>} */ (this._pending).push(() => this.delete(index, length));
@@ -6959,7 +7422,7 @@ class YText extends AbstractType {
     const y = this.doc;
     if (y !== null) {
       transact(y, transaction => {
-        const pos = findPosition(transaction, this, index);
+        const pos = findPosition(transaction, this, index, false);
         if (pos.right === null) {
           return
         }
@@ -7029,12 +7492,11 @@ class YText extends AbstractType {
    *
    * @note Xml-Text nodes don't have attributes. You can use this feature to assign properties to complete text-blocks.
    *
-   * @param {Snapshot} [snapshot]
    * @return {Object<string, any>} A JSON Object that describes the attributes.
    *
    * @public
    */
-  getAttributes (snapshot) {
+  getAttributes () {
     return typeMapGetAll(this)
   }
 
@@ -7047,17 +7509,18 @@ class YText extends AbstractType {
 }
 
 /**
- * @param {UpdateDecoderV1 | UpdateDecoderV2} decoder
+ * @param {UpdateDecoderV1 | UpdateDecoderV2} _decoder
  * @return {YText}
  *
  * @private
  * @function
  */
-const readYText = decoder => new YText();
+const readYText = _decoder => new YText();
 
 /**
  * @module YXml
  */
+
 
 /**
  * Define the elements to which a set of CSS queries apply.
@@ -7199,6 +7662,10 @@ class YXmlFragment extends AbstractType {
   }
 
   /**
+   * Makes a copy of this data type that can be included somewhere else.
+   *
+   * Note that the content is only readable _after_ it has been included somewhere in the Ydoc.
+   *
    * @return {YXmlFragment}
    */
   clone () {
@@ -7274,7 +7741,7 @@ class YXmlFragment extends AbstractType {
   querySelectorAll (query) {
     query = query.toUpperCase();
     // @ts-ignore
-    return Array.from(new YXmlTreeWalker(this, element => element.nodeName && element.nodeName.toUpperCase() === query))
+    return array__namespace.from(new YXmlTreeWalker(this, element => element.nodeName && element.nodeName.toUpperCase() === query))
   }
 
   /**
@@ -7442,6 +7909,15 @@ class YXmlFragment extends AbstractType {
   }
 
   /**
+   * Executes a provided function on once on every child element.
+   *
+   * @param {function(YXmlElement|YXmlText,number, typeof self):void} f A function to execute on every element of this YArray.
+   */
+  forEach (f) {
+    typeListForEach(this, f);
+  }
+
+  /**
    * Transform the properties of this type to binary and write it to an
    * BinaryEncoder.
    *
@@ -7455,20 +7931,26 @@ class YXmlFragment extends AbstractType {
 }
 
 /**
- * @param {UpdateDecoderV1 | UpdateDecoderV2} decoder
+ * @param {UpdateDecoderV1 | UpdateDecoderV2} _decoder
  * @return {YXmlFragment}
  *
  * @private
  * @function
  */
-const readYXmlFragment = decoder => new YXmlFragment();
+const readYXmlFragment = _decoder => new YXmlFragment();
+
+/**
+ * @typedef {Object|number|null|Array<any>|string|Uint8Array|AbstractType<any>} ValueTypes
+ */
 
 /**
  * An YXmlElement imitates the behavior of a
- * {@link https://developer.mozilla.org/en-US/docs/Web/API/Element|Dom Element}.
+ * https://developer.mozilla.org/en-US/docs/Web/API/Element|Dom Element
  *
  * * An YXmlElement has attributes (key value pairs)
  * * An YXmlElement has childElements that must inherit from YXmlElement
+ *
+ * @template {{ [key: string]: ValueTypes }} [KV={ [key: string]: string }]
  */
 class YXmlElement extends YXmlFragment {
   constructor (nodeName = 'UNDEFINED') {
@@ -7524,14 +8006,23 @@ class YXmlElement extends YXmlFragment {
   }
 
   /**
-   * @return {YXmlElement}
+   * Makes a copy of this data type that can be included somewhere else.
+   *
+   * Note that the content is only readable _after_ it has been included somewhere in the Ydoc.
+   *
+   * @return {YXmlElement<KV>}
    */
   clone () {
+    /**
+     * @type {YXmlElement<KV>}
+     */
     const el = new YXmlElement(this.nodeName);
     const attrs = this.getAttributes();
-    for (const key in attrs) {
-      el.setAttribute(key, attrs[key]);
-    }
+    object__namespace.forEach(attrs, (value, key) => {
+      if (typeof value === 'string') {
+        el.setAttribute(key, value);
+      }
+    });
     // @ts-ignore
     el.insert(0, this.toArray().map(item => item instanceof AbstractType ? item.clone() : item));
     return el
@@ -7567,7 +8058,7 @@ class YXmlElement extends YXmlFragment {
   /**
    * Removes an attribute from this YXmlElement.
    *
-   * @param {String} attributeName The attribute name that is to be removed.
+   * @param {string} attributeName The attribute name that is to be removed.
    *
    * @public
    */
@@ -7584,8 +8075,10 @@ class YXmlElement extends YXmlFragment {
   /**
    * Sets or updates an attribute.
    *
-   * @param {String} attributeName The attribute name that is to be set.
-   * @param {String} attributeValue The attribute value that is to be set.
+   * @template {keyof KV & string} KEY
+   *
+   * @param {KEY} attributeName The attribute name that is to be set.
+   * @param {KV[KEY]} attributeValue The attribute value that is to be set.
    *
    * @public
    */
@@ -7602,9 +8095,11 @@ class YXmlElement extends YXmlFragment {
   /**
    * Returns an attribute value that belongs to the attribute name.
    *
-   * @param {String} attributeName The attribute name that identifies the
+   * @template {keyof KV & string} KEY
+   *
+   * @param {KEY} attributeName The attribute name that identifies the
    *                               queried value.
-   * @return {String} The queried attribute value.
+   * @return {KV[KEY]|undefined} The queried attribute value.
    *
    * @public
    */
@@ -7615,7 +8110,7 @@ class YXmlElement extends YXmlFragment {
   /**
    * Returns whether an attribute exists
    *
-   * @param {String} attributeName The attribute name to check for existence.
+   * @param {string} attributeName The attribute name to check for existence.
    * @return {boolean} whether the attribute exists.
    *
    * @public
@@ -7628,12 +8123,12 @@ class YXmlElement extends YXmlFragment {
    * Returns all attribute name/value pairs in a JSON Object.
    *
    * @param {Snapshot} [snapshot]
-   * @return {Object<string, any>} A JSON Object that describes the attributes.
+   * @return {{ [Key in Extract<keyof KV,string>]?: KV[Key]}} A JSON Object that describes the attributes.
    *
    * @public
    */
   getAttributes (snapshot) {
-    return typeMapGetAll(this)
+    return /** @type {any} */ (snapshot ? typeMapGetAllSnapshot(this, snapshot) : typeMapGetAll(this))
   }
 
   /**
@@ -7655,7 +8150,10 @@ class YXmlElement extends YXmlFragment {
     const dom = _document.createElement(this.nodeName);
     const attrs = this.getAttributes();
     for (const key in attrs) {
-      dom.setAttribute(key, attrs[key]);
+      const value = attrs[key];
+      if (typeof value === 'string') {
+        dom.setAttribute(key, value);
+      }
     }
     typeListForEach(this, yxml => {
       dom.appendChild(yxml.toDOM(_document, hooks, binding));
@@ -7748,6 +8246,10 @@ class YXmlHook extends YMap {
   }
 
   /**
+   * Makes a copy of this data type that can be included somewhere else.
+   *
+   * Note that the content is only readable _after_ it has been included somewhere in the Ydoc.
+   *
    * @return {YXmlHook}
    */
   clone () {
@@ -7838,6 +8340,10 @@ class YXmlText extends YText {
   }
 
   /**
+   * Makes a copy of this data type that can be included somewhere else.
+   *
+   * Note that the content is only readable _after_ it has been included somewhere in the Ydoc.
+   *
    * @return {YXmlText}
    */
   clone () {
@@ -8480,28 +8986,30 @@ class ContentFormat {
   }
 
   /**
-   * @param {number} offset
+   * @param {number} _offset
    * @return {ContentFormat}
    */
-  splice (offset) {
+  splice (_offset) {
     throw error__namespace.methodUnimplemented()
   }
 
   /**
-   * @param {ContentFormat} right
+   * @param {ContentFormat} _right
    * @return {boolean}
    */
-  mergeWith (right) {
+  mergeWith (_right) {
     return false
   }
 
   /**
-   * @param {Transaction} transaction
+   * @param {Transaction} _transaction
    * @param {Item} item
    */
-  integrate (transaction, item) {
+  integrate (_transaction, item) {
     // @todo searchmarker are currently unsupported for rich text documents
-    /** @type {AbstractType<any>} */ (item.parent)._searchMarker = null;
+    const p = /** @type {YText} */ (item.parent);
+    p._searchMarker = null;
+    p._hasFormatting = true;
   }
 
   /**
@@ -8960,7 +9468,7 @@ class ContentType {
     while (item !== null) {
       if (!item.deleted) {
         item.delete(transaction);
-      } else {
+      } else if (item.id.clock < (transaction.beforeState.get(item.id.client) || 0)) {
         // This will be gc'd later and we want to merge it if possible
         // We try to merge all deleted items after each transaction,
         // but we have no knowledge about that this needs to be merged
@@ -8972,7 +9480,7 @@ class ContentType {
     this.type._map.forEach(item => {
       if (!item.deleted) {
         item.delete(transaction);
-      } else {
+      } else if (item.id.clock < (transaction.beforeState.get(item.id.client) || 0)) {
         // same as above
         transaction._mergeStructs.push(item);
       }
@@ -9115,6 +9623,12 @@ const splitItem = (transaction, leftItem, diff) => {
 };
 
 /**
+ * @param {Array<StackItem>} stack
+ * @param {ID} id
+ */
+const isDeletedByUndoStack = (stack, id) => array__namespace.some(stack, /** @param {StackItem} s */ s => isDeleted(s.deletions, id));
+
+/**
  * Redoes the effect of this operation.
  *
  * @param {Transaction} transaction The Yjs instance.
@@ -9122,12 +9636,13 @@ const splitItem = (transaction, leftItem, diff) => {
  * @param {Set<Item>} redoitems
  * @param {DeleteSet} itemsToDelete
  * @param {boolean} ignoreRemoteMapChanges
+ * @param {import('../utils/UndoManager.js').UndoManager} um
  *
  * @return {Item|null}
  *
  * @private
  */
-const redoItem = (transaction, item, redoitems, itemsToDelete, ignoreRemoteMapChanges) => {
+const redoItem = (transaction, item, redoitems, itemsToDelete, ignoreRemoteMapChanges, um) => {
   const doc = transaction.doc;
   const store = doc.store;
   const ownClientID = doc.clientID;
@@ -9147,7 +9662,7 @@ const redoItem = (transaction, item, redoitems, itemsToDelete, ignoreRemoteMapCh
   // make sure that parent is redone
   if (parentItem !== null && parentItem.deleted === true) {
     // try to undo parent if it will be undone anyway
-    if (parentItem.redone === null && (!redoitems.has(parentItem) || redoItem(transaction, parentItem, redoitems, itemsToDelete, ignoreRemoteMapChanges) === null)) {
+    if (parentItem.redone === null && (!redoitems.has(parentItem) || redoItem(transaction, parentItem, redoitems, itemsToDelete, ignoreRemoteMapChanges, um) === null)) {
       return null
     }
     while (parentItem.redone !== null) {
@@ -9197,18 +9712,10 @@ const redoItem = (transaction, item, redoitems, itemsToDelete, ignoreRemoteMapCh
       left = item;
       // Iterate right while right is in itemsToDelete
       // If it is intended to delete right while item is redone, we can expect that item should replace right.
-      while (left !== null && left.right !== null && isDeleted(itemsToDelete, left.right.id)) {
+      while (left !== null && left.right !== null && (left.right.redone || isDeleted(itemsToDelete, left.right.id) || isDeletedByUndoStack(um.undoStack, left.right.id) || isDeletedByUndoStack(um.redoStack, left.right.id))) {
         left = left.right;
-      }
-      // follow redone
-      // trace redone until parent matches
-      while (left !== null && left.redone !== null) {
-        left = getItemCleanStart(transaction, left.redone);
-      }
-      // check wether we were allowed to follow right (indicating that originally this op was replaced by another item)
-      if (left === null || /** @type {AbstractType<any>} */ (left.parent)._item !== parentItem) {
-        // invalid parent; should never happen
-        return null
+        // follow redone
+        while (left.redone) left = getItemCleanStart(transaction, left.redone);
       }
       if (left && left.right !== null) {
         // It is not possible to redo this item because it conflicts with a
@@ -9383,9 +9890,8 @@ class Item extends AbstractStruct {
     }
     if ((this.left && this.left.constructor === GC) || (this.right && this.right.constructor === GC)) {
       this.parent = null;
-    }
-    // only set parent if this shouldn't be garbage collected
-    if (!this.parent) {
+    } else if (!this.parent) {
+      // only set parent if this shouldn't be garbage collected
       if (this.left && this.left.constructor === Item) {
         this.parent = this.left.parent;
         this.parentSub = this.left.parentSub;
@@ -9771,18 +10277,21 @@ class Skip extends AbstractStruct {
 
 /** eslint-env browser */
 
-const glo = /** @type {any} */ (typeof window !== 'undefined'
-  ? window
-  // @ts-ignore
-  : typeof global !== 'undefined' ? global : {});
+
+const glo = /** @type {any} */ (typeof globalThis !== 'undefined'
+  ? globalThis
+  : typeof window !== 'undefined'
+    ? window
+    // @ts-ignore
+    : typeof global !== 'undefined' ? global : {});
 
 const importIdentifier = '__ $YJS$ __';
 
 if (glo[importIdentifier] === true) {
   /**
-   * Dear reader of this warning message. Please take this seriously.
+   * Dear reader of this message. Please take this seriously.
    *
-   * If you see this message, please make sure that you only import one version of Yjs. In many cases,
+   * If you see this message, make sure that you only import one version of Yjs. In many cases,
    * your package manager installs two versions of Yjs that are used by different packages within your project.
    * Another reason for this message is that some parts of your project use the commonjs version of Yjs
    * and others use the EcmaScript version of Yjs.
@@ -9790,8 +10299,10 @@ if (glo[importIdentifier] === true) {
    * This often leads to issues that are hard to debug. We often need to perform constructor checks,
    * e.g. `struct instanceof GC`. If you imported different versions of Yjs, it is impossible for us to
    * do the constructor checks anymore - which might break the CRDT algorithm.
+   *
+   * https://github.com/yjs/yjs/issues/438
    */
-  console.warn('Yjs was already imported. Importing different versions of Yjs often leads to issues.');
+  console.error('Yjs was already imported. This breaks constructor checks and will lead to issues! - https://github.com/yjs/yjs/issues/438');
 }
 glo[importIdentifier] = true;
 
@@ -9805,6 +10316,7 @@ var Y = /*#__PURE__*/Object.freeze({
   ContentAny: ContentAny,
   ContentBinary: ContentBinary,
   ContentDeleted: ContentDeleted,
+  ContentDoc: ContentDoc,
   ContentEmbed: ContentEmbed,
   ContentFormat: ContentFormat,
   ContentJSON: ContentJSON,
@@ -9817,10 +10329,15 @@ var Y = /*#__PURE__*/Object.freeze({
   Map: YMap,
   PermanentUserData: PermanentUserData,
   RelativePosition: RelativePosition,
+  Skip: Skip,
   Snapshot: Snapshot,
   Text: YText,
   Transaction: Transaction,
   UndoManager: UndoManager,
+  UpdateDecoderV1: UpdateDecoderV1,
+  UpdateDecoderV2: UpdateDecoderV2,
+  UpdateEncoderV1: UpdateEncoderV1,
+  UpdateEncoderV2: UpdateEncoderV2,
   XmlElement: YXmlElement,
   XmlFragment: YXmlFragment,
   XmlHook: YXmlHook,
@@ -9862,6 +10379,7 @@ var Y = /*#__PURE__*/Object.freeze({
   encodeStateVector: encodeStateVector,
   encodeStateVectorFromUpdate: encodeStateVectorFromUpdate,
   encodeStateVectorFromUpdateV2: encodeStateVectorFromUpdateV2,
+  equalDeleteSets: equalDeleteSets,
   equalSnapshots: equalSnapshots,
   findIndexSS: findIndexSS,
   findRootTypeKey: findRootTypeKey,
@@ -9876,15 +10394,19 @@ var Y = /*#__PURE__*/Object.freeze({
   logUpdateV2: logUpdateV2,
   mergeUpdates: mergeUpdates,
   mergeUpdatesV2: mergeUpdatesV2,
+  obfuscateUpdate: obfuscateUpdate,
+  obfuscateUpdateV2: obfuscateUpdateV2,
   parseUpdateMeta: parseUpdateMeta,
   parseUpdateMetaV2: parseUpdateMetaV2,
   readUpdate: readUpdate$1,
   readUpdateV2: readUpdateV2,
   relativePositionToJSON: relativePositionToJSON,
   snapshot: snapshot,
+  snapshotContainsUpdate: snapshotContainsUpdate,
   transact: transact,
   tryGc: tryGc,
   typeListToArraySnapshot: typeListToArraySnapshot,
+  typeMapGetAllSnapshot: typeMapGetAllSnapshot,
   typeMapGetSnapshot: typeMapGetSnapshot
 });
 
@@ -9910,8 +10432,8 @@ var Y = /*#__PURE__*/Object.freeze({
  * When the server receives SyncStep1, it should reply with SyncStep2 immediately followed by SyncStep1. The client replies
  * with SyncStep2 when it receives SyncStep1. Optionally the server may send a SyncDone after it received SyncStep2, so the
  * client knows that the sync is finished.  There are two reasons for this more elaborated sync model: 1. This protocol can
- * easily be implemented on top of http and websockets. 2. The server shoul only reply to requests, and not initiate them.
- * Therefore it is necesarry that the client initiates the sync.
+ * easily be implemented on top of http and websockets. 2. The server should only reply to requests, and not initiate them.
+ * Therefore it is necessary that the client initiates the sync.
  *
  * Construction of a message:
  * [messageType : varUint, message definition..]
@@ -9993,7 +10515,7 @@ const readUpdate = readSyncStep2;
 
 /**
  * @param {decoding.Decoder} decoder A message received from another client
- * @param {encoding.Encoder} encoder The reply message. Will not be sent if empty.
+ * @param {encoding.Encoder} encoder The reply message. Does not need to be sent if empty.
  * @param {Y.Doc} doc
  * @param {any} transactionOrigin
  */
@@ -10039,7 +10561,7 @@ const encV1 = {
   mergeUpdates: mergeUpdates,
   applyUpdate: applyUpdate,
   logUpdate: logUpdate,
-  updateEventName: 'update',
+  updateEventName: /** @type {'update'} */ ('update'),
   diffUpdate: diffUpdate
 };
 
@@ -10083,8 +10605,8 @@ class TestYInstance extends Doc {
         const encoder = encoding__namespace.createEncoder();
         writeUpdate(encoder, update);
         broadcastMessage(this, encoding__namespace.toUint8Array(encoder));
-        this.updates.push(update);
       }
+      this.updates.push(update);
     });
     this.connect();
   }
@@ -10127,12 +10649,7 @@ class TestYInstance extends Doc {
    * @param {TestYInstance} remoteClient
    */
   _receive (message, remoteClient) {
-    let messages = this.receiving.get(remoteClient);
-    if (messages === undefined) {
-      messages = [];
-      this.receiving.set(remoteClient, messages);
-    }
-    messages.push(message);
+    map__namespace.setIfUndefined(this.receiving, remoteClient, () => /** @type {Array<Uint8Array>} */ ([])).push(message);
   }
 }
 
@@ -10195,17 +10712,6 @@ class TestConnector {
       if (encoding__namespace.length(encoder) > 0) {
         // send reply message
         sender._receive(encoding__namespace.toUint8Array(encoder), receiver);
-      }
-      {
-        // If update message, add the received message to the list of received messages
-        const decoder = decoding__namespace.createDecoder(m);
-        const messageType = decoding__namespace.readVarUint(decoder);
-        switch (messageType) {
-          case messageYjsUpdate:
-          case messageYjsSyncStep2:
-            receiver.updates.push(decoding__namespace.readVarUint8Array(decoder));
-            break
-        }
       }
       return true
     }
@@ -10356,7 +10862,7 @@ const compare = users => {
     t__namespace.compare(userMapValues[i], userMapValues[i + 1]);
     t__namespace.compare(userXmlValues[i], userXmlValues[i + 1]);
     t__namespace.compare(userTextValues[i].map(/** @param {any} a */ a => typeof a.insert === 'string' ? a.insert : ' ').join('').length, users[i].getText('text').length);
-    t__namespace.compare(userTextValues[i], userTextValues[i + 1], '', (constructor, a, b) => {
+    t__namespace.compare(userTextValues[i], userTextValues[i + 1], '', (_constructor, a, b) => {
       if (a instanceof AbstractType) {
         t__namespace.compare(a.toJSON(), b.toJSON());
       } else if (a !== b) {
@@ -10365,8 +10871,9 @@ const compare = users => {
       return true
     });
     t__namespace.compare(encodeStateVector(users[i]), encodeStateVector(users[i + 1]));
-    compareDS(createDeleteSetFromStructStore(users[i].store), createDeleteSetFromStructStore(users[i + 1].store));
+    equalDeleteSets(createDeleteSetFromStructStore(users[i].store), createDeleteSetFromStructStore(users[i + 1].store));
     compareStructStores(users[i].store, users[i + 1].store);
+    t__namespace.compare(encodeSnapshot(snapshot(users[i])), encodeSnapshot(snapshot(users[i + 1])));
   }
   users.map(u => u.destroy());
 };
@@ -10379,8 +10886,8 @@ const compare = users => {
 const compareItemIDs = (a, b) => a === b || (a !== null && b != null && compareIDs(a.id, b.id));
 
 /**
- * @param {import('../src/internals').StructStore} ss1
- * @param {import('../src/internals').StructStore} ss2
+ * @param {import('../src/internals.js').StructStore} ss1
+ * @param {import('../src/internals.js').StructStore} ss2
  */
 const compareStructStores = (ss1, ss2) => {
   t__namespace.assert(ss1.clients.size === ss2.clients.size);
@@ -10419,25 +10926,6 @@ const compareStructStores = (ss1, ss2) => {
       }
     }
   }
-};
-
-/**
- * @param {import('../src/internals').DeleteSet} ds1
- * @param {import('../src/internals').DeleteSet} ds2
- */
-const compareDS = (ds1, ds2) => {
-  t__namespace.assert(ds1.clients.size === ds2.clients.size);
-  ds1.clients.forEach((deleteItems1, client) => {
-    const deleteItems2 = /** @type {Array<import('../src/internals').DeleteItem>} */ (ds2.clients.get(client));
-    t__namespace.assert(deleteItems2 !== undefined && deleteItems1.length === deleteItems2.length);
-    for (let i = 0; i < deleteItems1.length; i++) {
-      const di1 = deleteItems1[i];
-      const di2 = deleteItems2[i];
-      if (di1.clock !== di2.clock || di1.len !== di2.len) {
-        t__namespace.fail('DeleteSets dont match');
-      }
-    }
-  });
 };
 
 /**
@@ -10493,7 +10981,7 @@ const ySyncPluginKey = new prosemirrorState.PluginKey('y-sync');
  *
  * @public
  */
-new prosemirrorState.PluginKey('y-undo');
+const yUndoPluginKey = new prosemirrorState.PluginKey('y-undo');
 
 /**
  * The unique prosemirror plugin key for cursorPlugin
@@ -10510,7 +10998,13 @@ new prosemirrorState.PluginKey('yjs-cursor');
  * @param {Y.Item} item
  * @param {Y.Snapshot} [snapshot]
  */
-const isVisible = (item, snapshot) => snapshot === undefined ? !item.deleted : (snapshot.sv.has(item.id.client) && /** @type {number} */ (snapshot.sv.get(item.id.client)) > item.id.clock && !isDeleted(snapshot.ds, item.id));
+const isVisible = (item, snapshot) =>
+  snapshot === undefined
+    ? !item.deleted
+    : snapshot.sv.has(item.id.client) &&
+      /** @type {number} */
+      (snapshot.sv.get(item.id.client)) > item.id.clock &&
+      !isDeleted(snapshot.ds, item.id);
 
 /**
  * Either a node if type is YXmlElement or an Array of text nodes if YXmlText
@@ -10528,13 +11022,14 @@ const isVisible = (item, snapshot) => snapshot === undefined ? !item.deleted : (
  * @property {Array<ColorDef>} [YSyncOpts.colors]
  * @property {Map<string,ColorDef>} [YSyncOpts.colorMapping]
  * @property {Y.PermanentUserData|null} [YSyncOpts.permanentUserData]
+ * @property {ProsemirrorMapping} [YSyncOpts.mapping]
  * @property {function} [YSyncOpts.onFirstRender] Fired when the content from Yjs is initially rendered to ProseMirror
  */
 
 /**
  * @type {Array<ColorDef>}
  */
-const defaultColors = [{ light: '#ecd44433', dark: '#ecd444' }];
+const defaultColors = [{ light: "#ecd44433", dark: "#ecd444" }];
 
 /**
  * @param {Map<string,ColorDef>} colorMapping
@@ -10547,12 +11042,12 @@ const getUserColor = (colorMapping, colors, user) => {
   if (!colorMapping.has(user)) {
     if (colorMapping.size < colors.length) {
       const usedColors = set__namespace.create();
-      colorMapping.forEach(color => usedColors.add(color));
-      colors = colors.filter(color => !usedColors.has(color));
+      colorMapping.forEach((color) => usedColors.add(color));
+      colors = colors.filter((color) => !usedColors.has(color));
     }
     colorMapping.set(user, random__namespace.oneOf(colors));
   }
-  return /** @type {ColorDef} */ (colorMapping.get(user))
+  return /** @type {ColorDef} */ (colorMapping.get(user));
 };
 
 /**
@@ -10563,35 +11058,44 @@ const getUserColor = (colorMapping, colors, user) => {
  * @param {YSyncOpts} opts
  * @return {any} Returns a prosemirror plugin that binds to this type
  */
-const ySyncPlugin = (yXmlFragment, {
-  colors = defaultColors,
-  colorMapping = new Map(),
-  permanentUserData = null,
-  onFirstRender = () => {}
-} = {}) => {
-  let changedInitialContent = false;
-  let rerenderTimeoutId;
+const ySyncPlugin = (
+  yXmlFragment,
+  {
+    colors = defaultColors,
+    colorMapping = new Map(),
+    permanentUserData = null,
+    onFirstRender = () => {},
+    mapping,
+  } = {},
+) => {
+  let initialContentChanged = false;
+  const binding = new ProsemirrorBinding(yXmlFragment, mapping);
   const plugin = new prosemirrorState.Plugin({
     props: {
       editable: (state) => {
         const syncState = ySyncPluginKey.getState(state);
-        return syncState.snapshot == null && syncState.prevSnapshot == null
-      }
+        return syncState.snapshot == null && syncState.prevSnapshot == null;
+      },
     },
     key: ySyncPluginKey,
     state: {
-      init: (initargs, state) => {
+      /**
+       * @returns {any}
+       */
+      init: (_initargs, _state) => {
         return {
           type: yXmlFragment,
           doc: yXmlFragment.doc,
-          binding: null,
+          binding,
           snapshot: null,
           prevSnapshot: null,
           isChangeOrigin: false,
+          isUndoRedoOperation: false,
+          addToHistory: true,
           colors,
           colorMapping,
-          permanentUserData
-        }
+          permanentUserData,
+        };
       },
       apply: (tr, pluginState) => {
         const change = tr.getMeta(ySyncPluginKey);
@@ -10601,60 +11105,105 @@ const ySyncPlugin = (yXmlFragment, {
             pluginState[key] = change[key];
           }
         }
+        pluginState.addToHistory = tr.getMeta("addToHistory") !== false;
         // always set isChangeOrigin. If undefined, this is not change origin.
-        pluginState.isChangeOrigin = change !== undefined && !!change.isChangeOrigin;
-        if (pluginState.binding !== null) {
-          if (change !== undefined && (change.snapshot != null || change.prevSnapshot != null)) {
+        pluginState.isChangeOrigin =
+          change !== undefined && !!change.isChangeOrigin;
+        pluginState.isUndoRedoOperation =
+          change !== undefined &&
+          !!change.isChangeOrigin &&
+          !!change.isUndoRedoOperation;
+        if (binding.prosemirrorView !== null) {
+          if (
+            change !== undefined &&
+            (change.snapshot != null || change.prevSnapshot != null)
+          ) {
             // snapshot changed, rerender next
             eventloop__namespace.timeout(0, () => {
-              if (pluginState.binding == null || pluginState.binding.isDestroyed) {
-                return
+              if (binding.prosemirrorView == null) {
+                return;
               }
               if (change.restore == null) {
-                pluginState.binding._renderSnapshot(change.snapshot, change.prevSnapshot, pluginState);
+                binding._renderSnapshot(
+                  change.snapshot,
+                  change.prevSnapshot,
+                  pluginState,
+                );
               } else {
-                pluginState.binding._renderSnapshot(change.snapshot, change.snapshot, pluginState);
+                binding._renderSnapshot(
+                  change.snapshot,
+                  change.snapshot,
+                  pluginState,
+                );
                 // reset to current prosemirror state
                 delete pluginState.restore;
                 delete pluginState.snapshot;
                 delete pluginState.prevSnapshot;
-                pluginState.binding._prosemirrorChanged(pluginState.binding.prosemirrorView.state.doc);
+                binding.mux(() => {
+                  binding._prosemirrorChanged(
+                    binding.prosemirrorView.state.doc,
+                  );
+                });
               }
             });
           }
         }
-        return pluginState
-      }
+        return pluginState;
+      },
     },
-    view: view => {
-      const binding = new ProsemirrorBinding(yXmlFragment, view);
-      if (rerenderTimeoutId != null) {
-        clearTimeout(rerenderTimeoutId);
-      }
-      // Make sure this is called in a separate context
-      rerenderTimeoutId = eventloop__namespace.timeout(0, () => {
+    view: (view) => {
+      binding.initView(view);
+      if (mapping == null) {
+        // force rerender to update the bindings mapping
         binding._forceRerender();
-        view.dispatch(view.state.tr.setMeta(ySyncPluginKey, { binding }));
-        onFirstRender();
-      });
+      }
+      onFirstRender();
       return {
         update: () => {
           const pluginState = plugin.getState(view.state);
-          if (pluginState.snapshot == null && pluginState.prevSnapshot == null) {
-            if (changedInitialContent || view.state.doc.content.findDiffStart(view.state.doc.type.createAndFill().content) !== null) {
-              changedInitialContent = true;
-              binding._prosemirrorChanged(view.state.doc);
+          if (
+            pluginState.snapshot == null &&
+            pluginState.prevSnapshot == null
+          ) {
+            if (
+              // If the content doesn't change initially, we don't render anything to Yjs
+              // If the content was cleared by a user action, we want to catch the change and
+              // represent it in Yjs
+              initialContentChanged ||
+              view.state.doc.content.findDiffStart(
+                view.state.doc.type.createAndFill().content,
+              ) !== null
+            ) {
+              initialContentChanged = true;
+              if (
+                pluginState.addToHistory === false &&
+                !pluginState.isChangeOrigin
+              ) {
+                const yUndoPluginState = yUndoPluginKey.getState(view.state);
+                /**
+                 * @type {Y.UndoManager}
+                 */
+                const um = yUndoPluginState && yUndoPluginState.undoManager;
+                if (um) {
+                  um.stopCapturing();
+                }
+              }
+              binding.mux(() => {
+                /** @type {Y.Doc} */ (pluginState.doc).transact((tr) => {
+                  tr.meta.set("addToHistory", pluginState.addToHistory);
+                  binding._prosemirrorChanged(view.state.doc);
+                }, ySyncPluginKey);
+              });
             }
           }
         },
         destroy: () => {
-          clearTimeout(rerenderTimeoutId);
           binding.destroy();
-        }
-      }
-    }
+        },
+      };
+    },
   });
-  return plugin
+  return plugin;
 };
 
 /**
@@ -10664,8 +11213,18 @@ const ySyncPlugin = (yXmlFragment, {
  */
 const restoreRelativeSelection = (tr, relSel, binding) => {
   if (relSel !== null && relSel.anchor !== null && relSel.head !== null) {
-    const anchor = relativePositionToAbsolutePosition(binding.doc, binding.type, relSel.anchor, binding.mapping);
-    const head = relativePositionToAbsolutePosition(binding.doc, binding.type, relSel.head, binding.mapping);
+    const anchor = relativePositionToAbsolutePosition(
+      binding.doc,
+      binding.type,
+      relSel.anchor,
+      binding.mapping,
+    );
+    const head = relativePositionToAbsolutePosition(
+      binding.doc,
+      binding.type,
+      relSel.head,
+      binding.mapping,
+    );
     if (anchor !== null && head !== null) {
       tr = tr.setSelection(prosemirrorState.TextSelection.create(tr.doc, anchor, head));
     }
@@ -10673,8 +11232,16 @@ const restoreRelativeSelection = (tr, relSel, binding) => {
 };
 
 const getRelativeSelection = (pmbinding, state) => ({
-  anchor: absolutePositionToRelativePosition(state.selection.anchor, pmbinding.type, pmbinding.mapping),
-  head: absolutePositionToRelativePosition(state.selection.head, pmbinding.type, pmbinding.mapping)
+  anchor: absolutePositionToRelativePosition(
+    state.selection.anchor,
+    pmbinding.type,
+    pmbinding.mapping,
+  ),
+  head: absolutePositionToRelativePosition(
+    state.selection.head,
+    pmbinding.type,
+    pmbinding.mapping,
+  ),
 });
 
 /**
@@ -10685,17 +11252,17 @@ const getRelativeSelection = (pmbinding, state) => ({
 class ProsemirrorBinding {
   /**
    * @param {Y.XmlFragment} yXmlFragment The bind source
-   * @param {any} prosemirrorView The target binding
+   * @param {ProsemirrorMapping} mapping
    */
-  constructor (yXmlFragment, prosemirrorView) {
+  constructor(yXmlFragment, mapping = new Map()) {
     this.type = yXmlFragment;
-    this.prosemirrorView = prosemirrorView;
-    this.mux = mutex.createMutex();
-    this.isDestroyed = false;
     /**
-     * @type {ProsemirrorMapping}
+     * this will be set once the view is created
+     * @type {any}
      */
-    this.mapping = new Map();
+    this.prosemirrorView = null;
+    this.mux = mutex.createMutex();
+    this.mapping = mapping;
     this._observeFunction = this._typeChanged.bind(this);
     /**
      * @type {Y.Doc}
@@ -10707,18 +11274,19 @@ class ProsemirrorBinding {
      */
     this.beforeTransactionSelection = null;
     this.beforeAllTransactions = () => {
-      if (this.beforeTransactionSelection === null) {
-        this.beforeTransactionSelection = getRelativeSelection(this, prosemirrorView.state);
+      if (
+        this.beforeTransactionSelection === null &&
+        this.prosemirrorView != null
+      ) {
+        this.beforeTransactionSelection = getRelativeSelection(
+          this,
+          this.prosemirrorView.state,
+        );
       }
     };
     this.afterAllTransactions = () => {
       this.beforeTransactionSelection = null;
     };
-
-    this.doc.on('beforeAllTransactions', this.beforeAllTransactions);
-    this.doc.on('afterAllTransactions', this.afterAllTransactions);
-    yXmlFragment.observeDeep(this._observeFunction);
-
     this._domSelectionInView = null;
   }
 
@@ -10727,12 +11295,12 @@ class ProsemirrorBinding {
    *
    * @returns
    */
-  get _tr () {
-    return this.prosemirrorView.state.tr.setMeta('addToHistory', false)
+  get _tr() {
+    return this.prosemirrorView.state.tr.setMeta("addToHistory", false);
   }
 
-  _isLocalCursorInView () {
-    if (!this.prosemirrorView.hasFocus()) return false
+  _isLocalCursorInView() {
+    if (!this.prosemirrorView.hasFocus()) return false;
     if (environment__namespace.isBrowser && this._domSelectionInView === null) {
       // Calculate the domSelectionInView and clear by next tick after all events are finished
       eventloop__namespace.timeout(0, () => {
@@ -10740,10 +11308,10 @@ class ProsemirrorBinding {
       });
       this._domSelectionInView = this._isDomSelectionInView();
     }
-    return this._domSelectionInView
+    return this._domSelectionInView;
   }
 
-  _isDomSelectionInView () {
+  _isDomSelectionInView() {
     const selection = this.prosemirrorView._root.getSelection();
 
     const range = this.prosemirrorView._root.createRange();
@@ -10764,81 +11332,181 @@ class ProsemirrorBinding {
     const bounding = range.getBoundingClientRect();
     const documentElement = dom__namespace.doc.documentElement;
 
-    return bounding.bottom >= 0 && bounding.right >= 0 &&
-      bounding.left <= (window.innerWidth || documentElement.clientWidth || 0) &&
+    return (
+      bounding.bottom >= 0 &&
+      bounding.right >= 0 &&
+      bounding.left <=
+        (window.innerWidth || documentElement.clientWidth || 0) &&
       bounding.top <= (window.innerHeight || documentElement.clientHeight || 0)
-  }
-
-  renderSnapshot (snapshot, prevSnapshot) {
-    if (!prevSnapshot) {
-      prevSnapshot = createSnapshot(createDeleteSet(), new Map());
-    }
-    this.prosemirrorView.dispatch(this._tr.setMeta(ySyncPluginKey, { snapshot, prevSnapshot }));
-  }
-
-  unrenderSnapshot () {
-    this.mapping = new Map();
-    this.mux(() => {
-      const fragmentContent = this.type.toArray().map(t => createNodeFromYElement(/** @type {Y.XmlElement} */ (t), this.prosemirrorView.state.schema, this.mapping)).filter(n => n !== null);
-      // @ts-ignore
-      const tr = this._tr.replace(0, this.prosemirrorView.state.doc.content.size, new PModel__namespace.Slice(new PModel__namespace.Fragment(fragmentContent), 0, 0));
-      tr.setMeta(ySyncPluginKey, { snapshot: null, prevSnapshot: null });
-      this.prosemirrorView.dispatch(tr);
-    });
-  }
-
-  _forceRerender () {
-    this.mapping = new Map();
-    this.mux(() => {
-      const fragmentContent = this.type.toArray().map(t => createNodeFromYElement(/** @type {Y.XmlElement} */ (t), this.prosemirrorView.state.schema, this.mapping)).filter(n => n !== null);
-      // @ts-ignore
-      const tr = this._tr.replace(0, this.prosemirrorView.state.doc.content.size, new PModel__namespace.Slice(new PModel__namespace.Fragment(fragmentContent), 0, 0));
-      this.prosemirrorView.dispatch(tr.setMeta(ySyncPluginKey, { isChangeOrigin: true }));
-    });
+    );
   }
 
   /**
    * @param {Y.Snapshot} snapshot
    * @param {Y.Snapshot} prevSnapshot
+   */
+  renderSnapshot(snapshot, prevSnapshot) {
+    if (!prevSnapshot) {
+      prevSnapshot = createSnapshot(createDeleteSet(), new Map());
+    }
+    this.prosemirrorView.dispatch(
+      this._tr.setMeta(ySyncPluginKey, { snapshot, prevSnapshot }),
+    );
+  }
+
+  unrenderSnapshot() {
+    this.mapping.clear();
+    this.mux(() => {
+      const fragmentContent = this.type
+        .toArray()
+        .map((t) =>
+          createNodeFromYElement(
+            /** @type {Y.XmlElement} */ (t),
+            this.prosemirrorView.state.schema,
+            this.mapping,
+          ),
+        )
+        .filter((n) => n !== null);
+      // @ts-ignore
+      const tr = this._tr.replace(
+        0,
+        this.prosemirrorView.state.doc.content.size,
+        new PModel__namespace.Slice(PModel__namespace.Fragment.from(fragmentContent), 0, 0),
+      );
+      tr.setMeta(ySyncPluginKey, { snapshot: null, prevSnapshot: null });
+      this.prosemirrorView.dispatch(tr);
+    });
+  }
+
+  _forceRerender() {
+    this.mapping.clear();
+    this.mux(() => {
+      // If this is a forced rerender, this might neither happen as a pm change nor within a Yjs
+      // transaction. Then the "before selection" doesn't exist. In this case, we need to create a
+      // relative position before replacing content. Fixes #126
+      const sel =
+        this.beforeTransactionSelection !== null
+          ? null
+          : this.prosemirrorView.state.selection;
+      const fragmentContent = this.type
+        .toArray()
+        .map((t) =>
+          createNodeFromYElement(
+            /** @type {Y.XmlElement} */ (t),
+            this.prosemirrorView.state.schema,
+            this.mapping,
+          ),
+        )
+        .filter((n) => n !== null);
+      // @ts-ignore
+      const tr = this._tr.replace(
+        0,
+        this.prosemirrorView.state.doc.content.size,
+        new PModel__namespace.Slice(PModel__namespace.Fragment.from(fragmentContent), 0, 0),
+      );
+      if (sel) {
+        tr.setSelection(prosemirrorState.TextSelection.create(tr.doc, sel.anchor, sel.head));
+      }
+      this.prosemirrorView.dispatch(
+        tr.setMeta(ySyncPluginKey, { isChangeOrigin: true, binding: this }),
+      );
+    });
+  }
+
+  /**
+   * @param {Y.Snapshot|Uint8Array} snapshot
+   * @param {Y.Snapshot|Uint8Array} prevSnapshot
    * @param {Object} pluginState
    */
-  _renderSnapshot (snapshot$1, prevSnapshot, pluginState) {
+  _renderSnapshot(snapshot$1, prevSnapshot, pluginState) {
+    /**
+     * The document that contains the full history of this document.
+     * @type {Y.Doc}
+     */
+    let historyDoc = this.doc;
     if (!snapshot$1) {
       snapshot$1 = snapshot(this.doc);
     }
+    if (snapshot$1 instanceof Uint8Array || prevSnapshot instanceof Uint8Array) {
+      if (
+        !(snapshot$1 instanceof Uint8Array) ||
+        !(prevSnapshot instanceof Uint8Array)
+      ) {
+        // expected both snapshots to be v2 updates
+        error__namespace.unexpectedCase();
+      }
+      historyDoc = new Doc({ gc: false });
+      applyUpdateV2(historyDoc, prevSnapshot);
+      prevSnapshot = snapshot(historyDoc);
+      applyUpdateV2(historyDoc, snapshot$1);
+      snapshot$1 = snapshot(historyDoc);
+    }
     // clear mapping because we are going to rerender
-    this.mapping = new Map();
+    this.mapping.clear();
     this.mux(() => {
-      this.doc.transact(transaction => {
+      historyDoc.transact((transaction) => {
         // before rendering, we are going to sanitize ops and split deleted ops
         // if they were deleted by seperate users.
         const pud = pluginState.permanentUserData;
         if (pud) {
-          pud.dss.forEach(ds => {
-            iterateDeletedStructs(transaction, ds, item => {});
+          pud.dss.forEach((ds) => {
+            iterateDeletedStructs(transaction, ds, (_item) => {});
           });
         }
+        /**
+         * @param {'removed'|'added'} type
+         * @param {Y.ID} id
+         */
         const computeYChange = (type, id) => {
-          const user = type === 'added' ? pud.getUserByClientId(id.client) : pud.getUserByDeletedId(id);
+          const user =
+            type === "added"
+              ? pud.getUserByClientId(id.client)
+              : pud.getUserByDeletedId(id);
           return {
             user,
             type,
-            color: getUserColor(pluginState.colorMapping, pluginState.colors, user)
-          }
+            color: getUserColor(
+              pluginState.colorMapping,
+              pluginState.colors,
+              user,
+            ),
+          };
         };
         // Create document fragment and render
-        const fragmentContent = typeListToArraySnapshot(this.type, new Snapshot(prevSnapshot.ds, snapshot$1.sv)).map(t => {
-          if (!t._item.deleted || isVisible(t._item, snapshot$1) || isVisible(t._item, prevSnapshot)) {
-            return createNodeFromYElement(t, this.prosemirrorView.state.schema, new Map(), snapshot$1, prevSnapshot, computeYChange)
-          } else {
-            // No need to render elements that are not visible by either snapshot.
-            // If a client adds and deletes content in the same snapshot the element is not visible by either snapshot.
-            return null
-          }
-        }).filter(n => n !== null);
+        const fragmentContent = typeListToArraySnapshot(
+          this.type,
+          new Snapshot(prevSnapshot.ds, snapshot$1.sv),
+        )
+          .map((t) => {
+            if (
+              !t._item.deleted ||
+              isVisible(t._item, snapshot$1) ||
+              isVisible(t._item, prevSnapshot)
+            ) {
+              return createNodeFromYElement(
+                t,
+                this.prosemirrorView.state.schema,
+                new Map(),
+                snapshot$1,
+                prevSnapshot,
+                computeYChange,
+              );
+            } else {
+              // No need to render elements that are not visible by either snapshot.
+              // If a client adds and deletes content in the same snapshot the element is not visible by either snapshot.
+              return null;
+            }
+          })
+          .filter((n) => n !== null);
         // @ts-ignore
-        const tr = this._tr.replace(0, this.prosemirrorView.state.doc.content.size, new PModel__namespace.Slice(new PModel__namespace.Fragment(fragmentContent), 0, 0));
-        this.prosemirrorView.dispatch(tr.setMeta(ySyncPluginKey, { isChangeOrigin: true }));
+        const tr = this._tr.replace(
+          0,
+          this.prosemirrorView.state.doc.content.size,
+          new PModel__namespace.Slice(PModel__namespace.Fragment.from(fragmentContent), 0, 0),
+        );
+        this.prosemirrorView.dispatch(
+          tr.setMeta(ySyncPluginKey, { isChangeOrigin: true }),
+        );
       }, ySyncPluginKey);
     });
   }
@@ -10847,12 +11515,17 @@ class ProsemirrorBinding {
    * @param {Array<Y.YEvent<any>>} events
    * @param {Y.Transaction} transaction
    */
-  _typeChanged (events, transaction) {
+  _typeChanged(events, transaction) {
+    if (this.prosemirrorView == null) return;
     const syncState = ySyncPluginKey.getState(this.prosemirrorView.state);
-    if (events.length === 0 || syncState.snapshot != null || syncState.prevSnapshot != null) {
+    if (
+      events.length === 0 ||
+      syncState.snapshot != null ||
+      syncState.prevSnapshot != null
+    ) {
       // drop out if snapshot is active
       this.renderSnapshot(syncState.snapshot, syncState.prevSnapshot);
-      return
+      return;
     }
     this.mux(() => {
       /**
@@ -10860,35 +11533,75 @@ class ProsemirrorBinding {
        * @param {Y.AbstractType<any>} type
        */
       const delType = (_, type) => this.mapping.delete(type);
-      iterateDeletedStructs(transaction, transaction.deleteSet, struct => struct.constructor === Item && this.mapping.delete(/** @type {Y.ContentType} */ (/** @type {Y.Item} */ (struct).content).type));
+      iterateDeletedStructs(transaction, transaction.deleteSet, (struct) => {
+        if (struct.constructor === Item) {
+          const type = /** @type {Y.ContentType} */ (
+            /** @type {Y.Item} */ (struct).content
+          ).type;
+          type && this.mapping.delete(type);
+        }
+      });
       transaction.changed.forEach(delType);
       transaction.changedParentTypes.forEach(delType);
-      const fragmentContent = this.type.toArray().map(t => createNodeIfNotExists(/** @type {Y.XmlElement | Y.XmlHook} */ (t), this.prosemirrorView.state.schema, this.mapping)).filter(n => n !== null);
+      const fragmentContent = this.type
+        .toArray()
+        .map((t) =>
+          createNodeIfNotExists(
+            /** @type {Y.XmlElement | Y.XmlHook} */ (t),
+            this.prosemirrorView.state.schema,
+            this.mapping,
+          ),
+        )
+        .filter((n) => n !== null);
       // @ts-ignore
-      let tr = this._tr.replace(0, this.prosemirrorView.state.doc.content.size, new PModel__namespace.Slice(new PModel__namespace.Fragment(fragmentContent), 0, 0));
+      let tr = this._tr.replace(
+        0,
+        this.prosemirrorView.state.doc.content.size,
+        new PModel__namespace.Slice(PModel__namespace.Fragment.from(fragmentContent), 0, 0),
+      );
       restoreRelativeSelection(tr, this.beforeTransactionSelection, this);
-      tr = tr.setMeta(ySyncPluginKey, { isChangeOrigin: true });
-      if (this.beforeTransactionSelection !== null && this._isLocalCursorInView()) {
+      tr = tr.setMeta(ySyncPluginKey, {
+        isChangeOrigin: true,
+        isUndoRedoOperation: transaction.origin instanceof UndoManager,
+      });
+      if (
+        this.beforeTransactionSelection !== null &&
+        this._isLocalCursorInView()
+      ) {
         tr.scrollIntoView();
       }
       this.prosemirrorView.dispatch(tr);
     });
   }
 
-  _prosemirrorChanged (doc) {
-    this.mux(() => {
-      this.doc.transact(() => {
-        updateYFragment(this.doc, this.type, doc, this.mapping);
-        this.beforeTransactionSelection = getRelativeSelection(this, this.prosemirrorView.state);
-      }, ySyncPluginKey);
-    });
+  _prosemirrorChanged(doc) {
+    this.doc.transact(() => {
+      updateYFragment(this.doc, this.type, doc, this.mapping);
+      this.beforeTransactionSelection = getRelativeSelection(
+        this,
+        this.prosemirrorView.state,
+      );
+    }, ySyncPluginKey);
   }
 
-  destroy () {
-    this.isDestroyed = true;
+  /**
+   * View is ready to listen to changes. Register observers.
+   * @param {any} prosemirrorView
+   */
+  initView(prosemirrorView) {
+    if (this.prosemirrorView != null) this.destroy();
+    this.prosemirrorView = prosemirrorView;
+    this.doc.on("beforeAllTransactions", this.beforeAllTransactions);
+    this.doc.on("afterAllTransactions", this.afterAllTransactions);
+    this.type.observeDeep(this._observeFunction);
+  }
+
+  destroy() {
+    if (this.prosemirrorView == null) return;
+    this.prosemirrorView = null;
     this.type.unobserveDeep(this._observeFunction);
-    this.doc.off('beforeAllTransactions', this.beforeAllTransactions);
-    this.doc.off('afterAllTransactions', this.afterAllTransactions);
+    this.doc.off("beforeAllTransactions", this.beforeAllTransactions);
+    this.doc.off("afterAllTransactions", this.afterAllTransactions);
   }
 }
 
@@ -10902,16 +11615,30 @@ class ProsemirrorBinding {
  * @param {function('removed' | 'added', Y.ID):any} [computeYChange]
  * @return {PModel.Node | null}
  */
-const createNodeIfNotExists = (el, schema, mapping, snapshot, prevSnapshot, computeYChange) => {
+const createNodeIfNotExists = (
+  el,
+  schema,
+  mapping,
+  snapshot,
+  prevSnapshot,
+  computeYChange,
+) => {
   const node = /** @type {PModel.Node} */ (mapping.get(el));
   if (node === undefined) {
     if (el instanceof YXmlElement) {
-      return createNodeFromYElement(el, schema, mapping, snapshot, prevSnapshot, computeYChange)
+      return createNodeFromYElement(
+        el,
+        schema,
+        mapping,
+        snapshot,
+        prevSnapshot,
+        computeYChange,
+      );
     } else {
-      throw error__namespace.methodUnimplemented() // we are currently not handling hooks
+      throw error__namespace.methodUnimplemented(); // we are currently not handling hooks
     }
   }
-  return node
+  return node;
 };
 
 /**
@@ -10924,18 +11651,54 @@ const createNodeIfNotExists = (el, schema, mapping, snapshot, prevSnapshot, comp
  * @param {function('removed' | 'added', Y.ID):any} [computeYChange]
  * @return {PModel.Node | null} Returns node if node could be created. Otherwise it deletes the yjs type and returns null
  */
-const createNodeFromYElement = (el, schema, mapping, snapshot, prevSnapshot, computeYChange) => {
+const createNodeFromYElement = (
+  el,
+  schema,
+  mapping,
+  snapshot,
+  prevSnapshot,
+  computeYChange,
+) => {
   const children = [];
-  const createChildren = type => {
+  const createChildren = (type) => {
     if (type.constructor === YXmlElement) {
-      const n = createNodeIfNotExists(type, schema, mapping, snapshot, prevSnapshot, computeYChange);
+      const n = createNodeIfNotExists(
+        type,
+        schema,
+        mapping,
+        snapshot,
+        prevSnapshot,
+        computeYChange,
+      );
       if (n !== null) {
         children.push(n);
       }
     } else {
-      const ns = createTextNodesFromYText(type, schema, mapping, snapshot, prevSnapshot, computeYChange);
+      // If the next ytext exists and was created by us, move the content to the current ytext.
+      // This is a fix for #160 -- duplication of characters when two Y.Text exist next to each
+      // other.
+      const nextytext = type._item.right?.content.type;
+      if (
+        nextytext != null &&
+        !nextytext._item.deleted &&
+        nextytext._item.id.client === nextytext.doc.clientID
+      ) {
+        type.applyDelta([{ retain: type.length }, ...nextytext.toDelta()]);
+        nextytext.doc.transact((tr) => {
+          nextytext._item.delete(tr);
+        });
+      }
+      // now create the prosemirror text nodes
+      const ns = createTextNodesFromYText(
+        type,
+        schema,
+        mapping,
+        snapshot,
+        prevSnapshot,
+        computeYChange,
+      );
       if (ns !== null) {
-        ns.forEach(textchild => {
+        ns.forEach((textchild) => {
           if (textchild !== null) {
             children.push(textchild);
           }
@@ -10946,27 +11709,34 @@ const createNodeFromYElement = (el, schema, mapping, snapshot, prevSnapshot, com
   if (snapshot === undefined || prevSnapshot === undefined) {
     el.toArray().forEach(createChildren);
   } else {
-    typeListToArraySnapshot(el, new Snapshot(prevSnapshot.ds, snapshot.sv)).forEach(createChildren);
+    typeListToArraySnapshot(
+      el,
+      new Snapshot(prevSnapshot.ds, snapshot.sv),
+    ).forEach(createChildren);
   }
   try {
     const attrs = el.getAttributes(snapshot);
     if (snapshot !== undefined) {
       if (!isVisible(/** @type {Y.Item} */ (el._item), snapshot)) {
-        attrs.ychange = computeYChange ? computeYChange('removed', /** @type {Y.Item} */ (el._item).id) : { type: 'removed' };
+        attrs.ychange = computeYChange
+          ? computeYChange("removed", /** @type {Y.Item} */ (el._item).id)
+          : { type: "removed" };
       } else if (!isVisible(/** @type {Y.Item} */ (el._item), prevSnapshot)) {
-        attrs.ychange = computeYChange ? computeYChange('added', /** @type {Y.Item} */ (el._item).id) : { type: 'added' };
+        attrs.ychange = computeYChange
+          ? computeYChange("added", /** @type {Y.Item} */ (el._item).id)
+          : { type: "added" };
       }
     }
     const node = schema.node(el.nodeName, attrs, children);
     mapping.set(el, node);
-    return node
+    return node;
   } catch (e) {
     // an error occured while creating the node. This is probably a result of a concurrent action.
-    /** @type {Y.Doc} */ (el.doc).transact(transaction => {
+    /** @type {Y.Doc} */ (el.doc).transact((transaction) => {
       /** @type {Y.Item} */ (el._item).delete(transaction);
     }, ySyncPluginKey);
     mapping.delete(el);
-    return null
+    return null;
   }
 };
 
@@ -10974,13 +11744,20 @@ const createNodeFromYElement = (el, schema, mapping, snapshot, prevSnapshot, com
  * @private
  * @param {Y.XmlText} text
  * @param {any} schema
- * @param {ProsemirrorMapping} mapping
+ * @param {ProsemirrorMapping} _mapping
  * @param {Y.Snapshot} [snapshot]
  * @param {Y.Snapshot} [prevSnapshot]
  * @param {function('removed' | 'added', Y.ID):any} [computeYChange]
  * @return {Array<PModel.Node>|null}
  */
-const createTextNodesFromYText = (text, schema, mapping, snapshot, prevSnapshot, computeYChange) => {
+const createTextNodesFromYText = (
+  text,
+  schema,
+  _mapping,
+  snapshot,
+  prevSnapshot,
+  computeYChange,
+) => {
   const nodes = [];
   const deltas = text.toDelta(snapshot, prevSnapshot, computeYChange);
   try {
@@ -10990,7 +11767,7 @@ const createTextNodesFromYText = (text, schema, mapping, snapshot, prevSnapshot,
       for (const markName in delta.attributes) {
         if (Array.isArray(delta.attributes[markName])) {
           // multiple marks of same type
-          delta.attributes[markName].forEach(attrs => {
+          delta.attributes[markName].forEach((attrs) => {
             marks.push(schema.mark(markName, attrs));
           });
         } else {
@@ -11002,13 +11779,13 @@ const createTextNodesFromYText = (text, schema, mapping, snapshot, prevSnapshot,
     }
   } catch (e) {
     // an error occured while creating the node. This is probably a result of a concurrent action.
-    /** @type {Y.Doc} */ (text.doc).transact(transaction => {
+    /** @type {Y.Doc} */ (text.doc).transact((transaction) => {
       /** @type {Y.Item} */ (text._item).delete(transaction);
     }, ySyncPluginKey);
-    return null
+    return null;
   }
   // @ts-ignore
-  return nodes
+  return nodes;
 };
 
 /**
@@ -11019,14 +11796,14 @@ const createTextNodesFromYText = (text, schema, mapping, snapshot, prevSnapshot,
  */
 const createTypeFromTextNodes = (nodes, mapping) => {
   const type = new YXmlText();
-  const delta = nodes.map(node => ({
+  const delta = nodes.map((node) => ({
     // @ts-ignore
     insert: node.text,
-    attributes: marksToAttributes(node.marks)
+    attributes: marksToAttributes(node.marks),
   }));
   type.applyDelta(delta);
   mapping.set(type, nodes);
-  return type
+  return type;
 };
 
 /**
@@ -11039,13 +11816,18 @@ const createTypeFromElementNode = (node, mapping) => {
   const type = new YXmlElement(node.type.name);
   for (const key in node.attrs) {
     const val = node.attrs[key];
-    if (val !== null && key !== 'ychange') {
+    if (val !== null && key !== "ychange") {
       type.setAttribute(key, val);
     }
   }
-  type.insert(0, normalizePNodeContent(node).map(n => createTypeFromTextOrElementNode(n, mapping)));
+  type.insert(
+    0,
+    normalizePNodeContent(node).map((n) =>
+      createTypeFromTextOrElementNode(n, mapping),
+    ),
+  );
   mapping.set(type, node);
-  return type
+  return type;
 };
 
 /**
@@ -11054,27 +11836,35 @@ const createTypeFromElementNode = (node, mapping) => {
  * @param {ProsemirrorMapping} mapping
  * @return {Y.XmlElement|Y.XmlText}
  */
-const createTypeFromTextOrElementNode = (node, mapping) => node instanceof Array ? createTypeFromTextNodes(node, mapping) : createTypeFromElementNode(node, mapping);
+const createTypeFromTextOrElementNode = (node, mapping) =>
+  node instanceof Array
+    ? createTypeFromTextNodes(node, mapping)
+    : createTypeFromElementNode(node, mapping);
 
-const isObject = (val) => typeof val === 'object' && val !== null;
+const isObject = (val) => typeof val === "object" && val !== null;
 
 const equalAttrs = (pattrs, yattrs) => {
-  const keys = Object.keys(pattrs).filter(key => pattrs[key] !== null);
-  let eq = keys.length === Object.keys(yattrs).filter(key => yattrs[key] !== null).length;
+  const keys = Object.keys(pattrs).filter((key) => pattrs[key] !== null);
+  let eq =
+    keys.length ===
+    Object.keys(yattrs).filter((key) => yattrs[key] !== null).length;
   for (let i = 0; i < keys.length && eq; i++) {
     const key = keys[i];
     const l = pattrs[key];
     const r = yattrs[key];
-    eq = key === 'ychange' || l === r || (isObject(l) && isObject(r) && equalAttrs(l, r));
+    eq =
+      key === "ychange" ||
+      l === r ||
+      (isObject(l) && isObject(r) && equalAttrs(l, r));
   }
-  return eq
+  return eq;
 };
 
 const containsEqualMark = (pattrs, yattrs) => {
   if (Array.isArray(yattrs)) {
-    return !!yattrs.find(el => equalAttrs(pattrs, el))
+    return !!yattrs.find((el) => equalAttrs(pattrs, el));
   } else {
-    return equalAttrs(pattrs, yattrs)
+    return equalAttrs(pattrs, yattrs);
   }
 };
 
@@ -11086,7 +11876,7 @@ const containsEqualMark = (pattrs, yattrs) => {
  * @param {any} pnode
  * @return {NormalizedPNodeContent}
  */
-const normalizePNodeContent = pnode => {
+const normalizePNodeContent = (pnode) => {
   const c = pnode.content.content;
   const res = [];
   for (let i = 0; i < c.length; i++) {
@@ -11102,7 +11892,7 @@ const normalizePNodeContent = pnode => {
       res.push(n);
     }
   }
-  return res
+  return res;
 };
 
 const countYTextMarks = (yattrs) => {
@@ -11114,7 +11904,7 @@ const countYTextMarks = (yattrs) => {
       count++;
     }
   });
-  return count
+  return count;
 };
 
 /**
@@ -11123,7 +11913,17 @@ const countYTextMarks = (yattrs) => {
  */
 const equalYTextPText = (ytext, ptexts) => {
   const delta = ytext.toDelta();
-  return delta.length === ptexts.length && delta.every((d, i) => d.insert === /** @type {any} */ (ptexts[i]).text && countYTextMarks(d.attributes || {}) === ptexts[i].marks.length && ptexts[i].marks.every(mark => containsEqualMark(d.attributes[mark.type.name] || {}, mark.attrs)))
+  return (
+    delta.length === ptexts.length &&
+    delta.every(
+      (d, i) =>
+        d.insert === /** @type {any} */ (ptexts[i]).text &&
+        countYTextMarks(d.attributes || {}) === ptexts[i].marks.length &&
+        ptexts[i].marks.every((mark) =>
+          containsEqualMark(d.attributes[mark.type.name] || {}, mark.attrs),
+        ),
+    )
+  );
 };
 
 /**
@@ -11131,18 +11931,37 @@ const equalYTextPText = (ytext, ptexts) => {
  * @param {any|Array<any>} pnode
  */
 const equalYTypePNode = (ytype, pnode) => {
-  if (ytype instanceof YXmlElement && !(pnode instanceof Array) && matchNodeName(ytype, pnode)) {
+  if (
+    ytype instanceof YXmlElement &&
+    !(pnode instanceof Array) &&
+    matchNodeName(ytype, pnode)
+  ) {
     const normalizedContent = normalizePNodeContent(pnode);
-    return ytype._length === normalizedContent.length && equalAttrs(ytype.getAttributes(), pnode.attrs) && ytype.toArray().every((ychild, i) => equalYTypePNode(ychild, normalizedContent[i]))
+    return (
+      ytype._length === normalizedContent.length &&
+      equalAttrs(ytype.getAttributes(), pnode.attrs) &&
+      ytype
+        .toArray()
+        .every((ychild, i) => equalYTypePNode(ychild, normalizedContent[i]))
+    );
   }
-  return ytype instanceof YXmlText && pnode instanceof Array && equalYTextPText(ytype, pnode)
+  return (
+    ytype instanceof YXmlText &&
+    pnode instanceof Array &&
+    equalYTextPText(ytype, pnode)
+  );
 };
 
 /**
  * @param {PModel.Node | Array<PModel.Node> | undefined} mapped
  * @param {PModel.Node | Array<PModel.Node>} pcontent
  */
-const mappedIdentity = (mapped, pcontent) => mapped === pcontent || (mapped instanceof Array && pcontent instanceof Array && mapped.length === pcontent.length && mapped.every((a, i) => pcontent[i] === a));
+const mappedIdentity = (mapped, pcontent) =>
+  mapped === pcontent ||
+  (mapped instanceof Array &&
+    pcontent instanceof Array &&
+    mapped.length === pcontent.length &&
+    mapped.every((a, i) => pcontent[i] === a));
 
 /**
  * @param {Y.XmlElement} ytype
@@ -11163,9 +11982,9 @@ const computeChildEqualityFactor = (ytype, pnode, mapping) => {
     const leftY = yChildren[left];
     const leftP = pChildren[left];
     if (mappedIdentity(mapping.get(leftY), leftP)) {
-      foundMappedChild = true;// definite (good) match!
+      foundMappedChild = true; // definite (good) match!
     } else if (!equalYTypePNode(leftY, leftP)) {
-      break
+      break;
     }
   }
   for (; left + right < minCnt; right++) {
@@ -11174,17 +11993,17 @@ const computeChildEqualityFactor = (ytype, pnode, mapping) => {
     if (mappedIdentity(mapping.get(rightY), rightP)) {
       foundMappedChild = true;
     } else if (!equalYTypePNode(rightY, rightP)) {
-      break
+      break;
     }
   }
   return {
     equalityFactor: left + right,
-    foundMappedChild
-  }
+    foundMappedChild,
+  };
 };
 
-const ytextTrans = ytext => {
-  let str = '';
+const ytextTrans = (ytext) => {
+  let str = "";
   /**
    * @type {Y.Item|null}
    */
@@ -11202,8 +12021,8 @@ const ytextTrans = ytext => {
   }
   return {
     str,
-    nAttrs
-  }
+    nAttrs,
+  };
 };
 
 /**
@@ -11216,17 +12035,25 @@ const ytextTrans = ytext => {
 const updateYText = (ytext, ptexts, mapping) => {
   mapping.set(ytext, ptexts);
   const { nAttrs, str } = ytextTrans(ytext);
-  const content = ptexts.map(p => ({ insert: /** @type {any} */ (p).text, attributes: Object.assign({}, nAttrs, marksToAttributes(p.marks)) }));
-  const { insert, remove, index } = diff.simpleDiff(str, content.map(c => c.insert).join(''));
+  const content = ptexts.map((p) => ({
+    insert: /** @type {any} */ (p).text,
+    attributes: Object.assign({}, nAttrs, marksToAttributes(p.marks)),
+  }));
+  const { insert, remove, index } = diff.simpleDiff(
+    str,
+    content.map((c) => c.insert).join(""),
+  );
   ytext.delete(index, remove);
   ytext.insert(index, insert);
-  ytext.applyDelta(content.map(c => ({ retain: c.insert.length, attributes: c.attributes })));
+  ytext.applyDelta(
+    content.map((c) => ({ retain: c.insert.length, attributes: c.attributes })),
+  );
 };
 
-const marksToAttributes = marks => {
+const marksToAttributes = (marks) => {
   const pattrs = {};
-  marks.forEach(mark => {
-    if (mark.type.name !== 'ychange') {
+  marks.forEach((mark) => {
+    if (mark.type.name !== "ychange") {
       if (pattrs[mark.type.name] && Array.isArray(pattrs[mark.type.name])) {
         // already has multiple marks of same type
         pattrs[mark.type.name].push(mark.attrs);
@@ -11239,19 +12066,28 @@ const marksToAttributes = marks => {
       }
     }
   });
-  return pattrs
+  return pattrs;
 };
 
 /**
+ * Update a yDom node by syncing the current content of the prosemirror node.
+ *
+ * This is a y-prosemirror internal feature that you can use at your own risk.
+ *
  * @private
+ * @unstable
+ *
  * @param {{transact: Function}} y
  * @param {Y.XmlFragment} yDomFragment
  * @param {any} pNode
  * @param {ProsemirrorMapping} mapping
  */
 const updateYFragment = (y, yDomFragment, pNode, mapping) => {
-  if (yDomFragment instanceof YXmlElement && yDomFragment.nodeName !== pNode.type.name) {
-    throw new Error('node name mismatch!')
+  if (
+    yDomFragment instanceof YXmlElement &&
+    yDomFragment.nodeName !== pNode.type.name
+  ) {
+    throw new Error("node name mismatch!");
   }
   mapping.set(yDomFragment, pNode);
   // update attributes
@@ -11260,7 +12096,7 @@ const updateYFragment = (y, yDomFragment, pNode, mapping) => {
     const pAttrs = pNode.attrs;
     for (const key in pAttrs) {
       if (pAttrs[key] !== null) {
-        if (yDomAttrs[key] !== pAttrs[key] && key !== 'ychange') {
+        if (yDomAttrs[key] !== pAttrs[key] && key !== "ychange") {
           yDomFragment.setAttribute(key, pAttrs[key]);
         }
       } else {
@@ -11283,7 +12119,7 @@ const updateYFragment = (y, yDomFragment, pNode, mapping) => {
   let left = 0;
   let right = 0;
   // find number of matching elements from left
-  for (;left < minCnt; left++) {
+  for (; left < minCnt; left++) {
     const leftY = yChildren[left];
     const leftP = pChildren[left];
     if (!mappedIdentity(mapping.get(leftY), leftP)) {
@@ -11291,12 +12127,12 @@ const updateYFragment = (y, yDomFragment, pNode, mapping) => {
         // update mapping
         mapping.set(leftY, leftP);
       } else {
-        break
+        break;
       }
     }
   }
   // find number of matching elements from right
-  for (;right + left + 1 < minCnt; right++) {
+  for (; right + left + 1 < minCnt; right++) {
     const rightY = yChildren[yChildCnt - right - 1];
     const rightP = pChildren[pChildCnt - right - 1];
     if (!mappedIdentity(mapping.get(rightY), rightP)) {
@@ -11304,7 +12140,7 @@ const updateYFragment = (y, yDomFragment, pNode, mapping) => {
         // update mapping
         mapping.set(rightY, rightP);
       } else {
-        break
+        break;
       }
     }
   }
@@ -11321,41 +12157,80 @@ const updateYFragment = (y, yDomFragment, pNode, mapping) => {
         }
         left += 1;
       } else {
-        let updateLeft = leftY instanceof YXmlElement && matchNodeName(leftY, leftP);
-        let updateRight = rightY instanceof YXmlElement && matchNodeName(rightY, rightP);
+        let updateLeft =
+          leftY instanceof YXmlElement && matchNodeName(leftY, leftP);
+        let updateRight =
+          rightY instanceof YXmlElement && matchNodeName(rightY, rightP);
         if (updateLeft && updateRight) {
           // decide which which element to update
-          const equalityLeft = computeChildEqualityFactor(/** @type {Y.XmlElement} */ (leftY), /** @type {PModel.Node} */ (leftP), mapping);
-          const equalityRight = computeChildEqualityFactor(/** @type {Y.XmlElement} */ (rightY), /** @type {PModel.Node} */ (rightP), mapping);
-          if (equalityLeft.foundMappedChild && !equalityRight.foundMappedChild) {
+          const equalityLeft = computeChildEqualityFactor(
+            /** @type {Y.XmlElement} */ (leftY),
+            /** @type {PModel.Node} */ (leftP),
+            mapping,
+          );
+          const equalityRight = computeChildEqualityFactor(
+            /** @type {Y.XmlElement} */ (rightY),
+            /** @type {PModel.Node} */ (rightP),
+            mapping,
+          );
+          if (
+            equalityLeft.foundMappedChild &&
+            !equalityRight.foundMappedChild
+          ) {
             updateRight = false;
-          } else if (!equalityLeft.foundMappedChild && equalityRight.foundMappedChild) {
+          } else if (
+            !equalityLeft.foundMappedChild &&
+            equalityRight.foundMappedChild
+          ) {
             updateLeft = false;
-          } else if (equalityLeft.equalityFactor < equalityRight.equalityFactor) {
+          } else if (
+            equalityLeft.equalityFactor < equalityRight.equalityFactor
+          ) {
             updateLeft = false;
           } else {
             updateRight = false;
           }
         }
         if (updateLeft) {
-          updateYFragment(y, /** @type {Y.XmlFragment} */ (leftY), /** @type {PModel.Node} */ (leftP), mapping);
+          updateYFragment(
+            y,
+            /** @type {Y.XmlFragment} */ (leftY),
+            /** @type {PModel.Node} */ (leftP),
+            mapping,
+          );
           left += 1;
         } else if (updateRight) {
-          updateYFragment(y, /** @type {Y.XmlFragment} */ (rightY), /** @type {PModel.Node} */ (rightP), mapping);
+          updateYFragment(
+            y,
+            /** @type {Y.XmlFragment} */ (rightY),
+            /** @type {PModel.Node} */ (rightP),
+            mapping,
+          );
           right += 1;
         } else {
+          mapping.delete(yDomFragment.get(left));
           yDomFragment.delete(left, 1);
-          yDomFragment.insert(left, [createTypeFromTextOrElementNode(leftP, mapping)]);
+          yDomFragment.insert(left, [
+            createTypeFromTextOrElementNode(leftP, mapping),
+          ]);
           left += 1;
         }
       }
     }
     const yDelLen = yChildCnt - left - right;
-    if (yChildCnt === 1 && pChildCnt === 0 && yChildren[0] instanceof YXmlText) {
+    if (
+      yChildCnt === 1 &&
+      pChildCnt === 0 &&
+      yChildren[0] instanceof YXmlText
+    ) {
+      mapping.delete(yChildren[0]);
       // Edge case handling https://github.com/yjs/y-prosemirror/issues/108
       // Only delete the content of the Y.Text to retain remote changes on the same Y.Text object
       yChildren[0].delete(0, yChildren[0].length);
     } else if (yDelLen > 0) {
+      yDomFragment
+        .slice(left, left + yDelLen)
+        .forEach((type) => mapping.delete(type));
       yDomFragment.delete(left, yDelLen);
     }
     if (left + right < pChildCnt) {
@@ -11373,7 +12248,8 @@ const updateYFragment = (y, yDomFragment, pNode, mapping) => {
  * @param {Y.XmlElement} yElement
  * @param {any} pNode Prosemirror Node
  */
-const matchNodeName = (yElement, pNode) => !(pNode instanceof Array) && yElement.nodeName === pNode.type.name;
+const matchNodeName = (yElement, pNode) =>
+  !(pNode instanceof Array) && yElement.nodeName === pNode.type.name;
 
 /**
  * Transforms a Prosemirror based absolute position to a Yjs Cursor (relative position in the Yjs model).
@@ -11385,7 +12261,7 @@ const matchNodeName = (yElement, pNode) => !(pNode instanceof Array) && yElement
  */
 const absolutePositionToRelativePosition = (pos, type, mapping) => {
   if (pos === 0) {
-    return createRelativePositionFromTypeIndex(type, 0)
+    return createRelativePositionFromTypeIndex(type, 0, -1)
   }
   /**
    * @type {any}
@@ -11394,7 +12270,7 @@ const absolutePositionToRelativePosition = (pos, type, mapping) => {
   while (n !== null && type !== n) {
     if (n instanceof YXmlText) {
       if (n._length >= pos) {
-        return createRelativePositionFromTypeIndex(n, pos)
+        return createRelativePositionFromTypeIndex(n, pos, -1)
       } else {
         pos -= n._length;
       }
@@ -11448,7 +12324,7 @@ const absolutePositionToRelativePosition = (pos, type, mapping) => {
       return createRelativePosition(n._item.parent, n._item)
     }
   }
-  return createRelativePositionFromTypeIndex(type, type._length)
+  return createRelativePositionFromTypeIndex(type, type._length, -1)
 };
 
 const createRelativePosition = (type, item) => {
@@ -11603,6 +12479,9 @@ function prosemirrorJSONToYXmlFragment (schema, state, xmlFragment) {
 }
 
 /**
+ *
+ * @deprecated Use `yXmlFragmentToProseMirrorRootNode` instead
+ *
  * Utility method to convert a Y.Doc to Prosemirror compatible JSON.
  *
  * @param {Y.Doc} ydoc
@@ -11617,6 +12496,8 @@ function yDocToProsemirrorJSON (
 }
 
 /**
+ * @deprecated Use `yXmlFragmentToProseMirrorRootNode` instead
+ *
  * Utility method to convert a Y.Doc to Prosemirror compatible JSON.
  *
  * @param {Y.XmlFragment} xmlFragment The fragment, which must be part of a Y.Doc.
@@ -11701,7 +12582,99 @@ function yXmlFragmentToProsemirrorJSON (xmlFragment) {
   }
 }
 
-const brDOM = ['br'];
+const undo = state => {
+  const undoManager = yUndoPluginKey.getState(state).undoManager;
+  if (undoManager != null) {
+    undoManager.undo();
+    return true
+  }
+};
+
+const redo = state => {
+  const undoManager = yUndoPluginKey.getState(state).undoManager;
+  if (undoManager != null) {
+    undoManager.redo();
+    return true
+  }
+};
+
+const defaultProtectedNodes = new Set(['paragraph']);
+
+const defaultDeleteFilter = (item, protectedNodes) => !(item instanceof Item) ||
+!(item.content instanceof ContentType) ||
+!(item.content.type instanceof YText ||
+  (item.content.type instanceof YXmlElement && protectedNodes.has(item.content.type.nodeName))) ||
+item.content.type._length === 0;
+
+const yUndoPlugin = ({ protectedNodes = defaultProtectedNodes, trackedOrigins = [], undoManager = null } = {}) => new prosemirrorState.Plugin({
+  key: yUndoPluginKey,
+  state: {
+    init: (initargs, state) => {
+      // TODO: check if plugin order matches and fix
+      const ystate = ySyncPluginKey.getState(state);
+      const _undoManager = undoManager || new UndoManager(ystate.type, {
+        trackedOrigins: new Set([ySyncPluginKey].concat(trackedOrigins)),
+        deleteFilter: (item) => defaultDeleteFilter(item, protectedNodes),
+        captureTransaction: tr => tr.meta.get('addToHistory') !== false
+      });
+      return {
+        undoManager: _undoManager,
+        prevSel: null,
+        hasUndoOps: _undoManager.undoStack.length > 0,
+        hasRedoOps: _undoManager.redoStack.length > 0
+      }
+    },
+    /**
+     * @returns {any}
+     */
+    apply: (tr, val, oldState, state) => {
+      const binding = ySyncPluginKey.getState(state).binding;
+      const undoManager = val.undoManager;
+      const hasUndoOps = undoManager.undoStack.length > 0;
+      const hasRedoOps = undoManager.redoStack.length > 0;
+      if (binding) {
+        return {
+          undoManager,
+          prevSel: getRelativeSelection(binding, oldState),
+          hasUndoOps,
+          hasRedoOps
+        }
+      } else {
+        if (hasUndoOps !== val.hasUndoOps || hasRedoOps !== val.hasRedoOps) {
+          return Object.assign({}, val, {
+            hasUndoOps: undoManager.undoStack.length > 0,
+            hasRedoOps: undoManager.redoStack.length > 0
+          })
+        } else { // nothing changed
+          return val
+        }
+      }
+    }
+  },
+  view: view => {
+    const ystate = ySyncPluginKey.getState(view.state);
+    const undoManager = yUndoPluginKey.getState(view.state).undoManager;
+    undoManager.on('stack-item-added', ({ stackItem }) => {
+      const binding = ystate.binding;
+      if (binding) {
+        stackItem.meta.set(binding, yUndoPluginKey.getState(view.state).prevSel);
+      }
+    });
+    undoManager.on('stack-item-popped', ({ stackItem }) => {
+      const binding = ystate.binding;
+      if (binding) {
+        binding.beforeTransactionSelection = stackItem.meta.get(binding) || binding.beforeTransactionSelection;
+      }
+    });
+    return {
+      destroy: () => {
+        undoManager.destroy();
+      }
+    }
+  }
+});
+
+const brDOM = ["br"];
 
 const calcYchangeDomAttrs = (attrs, domAttrs = {}) => {
   domAttrs = Object.assign({}, domAttrs);
@@ -11709,7 +12682,7 @@ const calcYchangeDomAttrs = (attrs, domAttrs = {}) => {
     domAttrs.ychange_user = attrs.ychange.user;
     domAttrs.ychange_state = attrs.ychange.state;
   }
-  return domAttrs
+  return domAttrs;
 };
 
 // :: Object
@@ -11717,50 +12690,50 @@ const calcYchangeDomAttrs = (attrs, domAttrs = {}) => {
 const nodes = {
   // :: NodeSpec The top level document node.
   doc: {
-    content: 'custom paragraph'
+    content: "custom paragraph",
   },
 
   custom: {
     atom: true,
     attrs: { checked: { default: false } },
-    parseDOM: [{ tag: 'div' }],
-    toDOM () {
-      return ['div']
-    }
+    parseDOM: [{ tag: "div" }],
+    toDOM() {
+      return ["div"];
+    },
   },
 
   // :: NodeSpec A plain paragraph textblock. Represented in the DOM
   // as a `<p>` element.
   paragraph: {
     attrs: { ychange: { default: null } },
-    content: 'inline*',
-    group: 'block',
-    parseDOM: [{ tag: 'p' }],
-    toDOM (node) {
-      return ['p', calcYchangeDomAttrs(node.attrs), 0]
-    }
+    content: "inline*",
+    group: "block",
+    parseDOM: [{ tag: "p" }],
+    toDOM(node) {
+      return ["p", calcYchangeDomAttrs(node.attrs), 0];
+    },
   },
 
   // :: NodeSpec A blockquote (`<blockquote>`) wrapping one or more blocks.
   blockquote: {
     attrs: { ychange: { default: null } },
-    content: 'block+',
-    group: 'block',
+    content: "block+",
+    group: "block",
     defining: true,
-    parseDOM: [{ tag: 'blockquote' }],
-    toDOM (node) {
-      return ['blockquote', calcYchangeDomAttrs(node.attrs), 0]
-    }
+    parseDOM: [{ tag: "blockquote" }],
+    toDOM(node) {
+      return ["blockquote", calcYchangeDomAttrs(node.attrs), 0];
+    },
   },
 
   // :: NodeSpec A horizontal rule (`<hr>`).
   horizontal_rule: {
     attrs: { ychange: { default: null } },
-    group: 'block',
-    parseDOM: [{ tag: 'hr' }],
-    toDOM (node) {
-      return ['hr', calcYchangeDomAttrs(node.attrs)]
-    }
+    group: "block",
+    parseDOM: [{ tag: "hr" }],
+    toDOM(node) {
+      return ["hr", calcYchangeDomAttrs(node.attrs)];
+    },
   },
 
   // :: NodeSpec A heading textblock, with a `level` attribute that
@@ -11769,22 +12742,22 @@ const nodes = {
   heading: {
     attrs: {
       level: { default: 1 },
-      ychange: { default: null }
+      ychange: { default: null },
     },
-    content: 'inline*',
-    group: 'block',
+    content: "inline*",
+    group: "block",
     defining: true,
     parseDOM: [
-      { tag: 'h1', attrs: { level: 1 } },
-      { tag: 'h2', attrs: { level: 2 } },
-      { tag: 'h3', attrs: { level: 3 } },
-      { tag: 'h4', attrs: { level: 4 } },
-      { tag: 'h5', attrs: { level: 5 } },
-      { tag: 'h6', attrs: { level: 6 } }
+      { tag: "h1", attrs: { level: 1 } },
+      { tag: "h2", attrs: { level: 2 } },
+      { tag: "h3", attrs: { level: 3 } },
+      { tag: "h4", attrs: { level: 4 } },
+      { tag: "h5", attrs: { level: 5 } },
+      { tag: "h6", attrs: { level: 6 } },
     ],
-    toDOM (node) {
-      return ['h' + node.attrs.level, calcYchangeDomAttrs(node.attrs), 0]
-    }
+    toDOM(node) {
+      return ["h" + node.attrs.level, calcYchangeDomAttrs(node.attrs), 0];
+    },
   },
 
   // :: NodeSpec A code listing. Disallows marks or non-text inline
@@ -11792,20 +12765,20 @@ const nodes = {
   // `<code>` element inside of it.
   code_block: {
     attrs: { ychange: { default: null } },
-    content: 'text*',
-    marks: '',
-    group: 'block',
+    content: "text*",
+    marks: "",
+    group: "block",
     code: true,
     defining: true,
-    parseDOM: [{ tag: 'pre', preserveWhitespace: 'full' }],
-    toDOM (node) {
-      return ['pre', calcYchangeDomAttrs(node.attrs), ['code', 0]]
-    }
+    parseDOM: [{ tag: "pre", preserveWhitespace: "full" }],
+    toDOM(node) {
+      return ["pre", calcYchangeDomAttrs(node.attrs), ["code", 0]];
+    },
   },
 
   // :: NodeSpec The text node.
   text: {
-    group: 'inline'
+    group: "inline",
   },
 
   // :: NodeSpec An inline image (`<img>`) node. Supports `src`,
@@ -11817,48 +12790,48 @@ const nodes = {
       ychange: { default: null },
       src: {},
       alt: { default: null },
-      title: { default: null }
+      title: { default: null },
     },
-    group: 'inline',
+    group: "inline",
     draggable: true,
     parseDOM: [
       {
-        tag: 'img[src]',
-        getAttrs (dom) {
+        tag: "img[src]",
+        getAttrs(dom) {
           return {
-            src: dom.getAttribute('src'),
-            title: dom.getAttribute('title'),
-            alt: dom.getAttribute('alt')
-          }
-        }
-      }
+            src: dom.getAttribute("src"),
+            title: dom.getAttribute("title"),
+            alt: dom.getAttribute("alt"),
+          };
+        },
+      },
     ],
-    toDOM (node) {
+    toDOM(node) {
       const domAttrs = {
         src: node.attrs.src,
         title: node.attrs.title,
-        alt: node.attrs.alt
+        alt: node.attrs.alt,
       };
-      return ['img', calcYchangeDomAttrs(node.attrs, domAttrs)]
-    }
+      return ["img", calcYchangeDomAttrs(node.attrs, domAttrs)];
+    },
   },
 
   // :: NodeSpec A hard line break, represented in the DOM as `<br>`.
   hard_break: {
     inline: true,
-    group: 'inline',
+    group: "inline",
     selectable: false,
-    parseDOM: [{ tag: 'br' }],
-    toDOM () {
-      return brDOM
-    }
-  }
+    parseDOM: [{ tag: "br" }],
+    toDOM() {
+      return brDOM;
+    },
+  },
 };
 
-const emDOM = ['em', 0];
-const strongDOM = ['strong', 0];
-const codeDOM = ['code', 0];
-const commentDOM = ['span', 0];
+const emDOM = ["em", 0];
+const strongDOM = ["strong", 0];
+const codeDOM = ["code", 0];
+const commentDOM = ["span", 0];
 
 // :: Object [Specs](#model.MarkSpec) for the marks in the schema.
 const marks = {
@@ -11868,88 +12841,87 @@ const marks = {
   link: {
     attrs: {
       href: {},
-      title: { default: null }
+      title: { default: null },
     },
     inclusive: false,
     parseDOM: [
       {
-        tag: 'a[href]',
-        getAttrs (dom) {
+        tag: "a[href]",
+        getAttrs(dom) {
           return {
-            href: dom.getAttribute('href'),
-            title: dom.getAttribute('title')
-          }
-        }
-      }
+            href: dom.getAttribute("href"),
+            title: dom.getAttribute("title"),
+          };
+        },
+      },
     ],
-    toDOM (node) {
-      return ['a', node.attrs, 0]
-    }
+    toDOM(node) {
+      return ["a", node.attrs, 0];
+    },
   },
 
   // :: MarkSpec An emphasis mark. Rendered as an `<em>` element.
   // Has parse rules that also match `<i>` and `font-style: italic`.
   em: {
-    parseDOM: [{ tag: 'i' }, { tag: 'em' }, { style: 'font-style=italic' }],
-    toDOM () {
-      return emDOM
-    }
+    parseDOM: [{ tag: "i" }, { tag: "em" }, { style: "font-style=italic" }],
+    toDOM() {
+      return emDOM;
+    },
   },
 
   // :: MarkSpec A strong mark. Rendered as `<strong>`, parse rules
   // also match `<b>` and `font-weight: bold`.
   strong: {
     parseDOM: [
-      { tag: 'strong' },
+      { tag: "strong" },
       // This works around a Google Docs misbehavior where
       // pasted content will be inexplicably wrapped in `<b>`
       // tags with a font-weight normal.
       {
-        tag: 'b',
-        getAttrs: node => node.style.fontWeight !== 'normal' && null
+        tag: "b",
+        getAttrs: (node) => node.style.fontWeight !== "normal" && null,
       },
       {
-        style: 'font-weight',
-        getAttrs: value => /^(bold(er)?|[5-9]\d{2,})$/.test(value) && null
-      }
+        style: "font-weight",
+        getAttrs: (value) => /^(bold(er)?|[5-9]\d{2,})$/.test(value) && null,
+      },
     ],
-    toDOM () {
-      return strongDOM
-    }
+    toDOM() {
+      return strongDOM;
+    },
   },
 
   // :: MarkSpec Code font mark. Represented as a `<code>` element.
   code: {
-    parseDOM: [{ tag: 'code' }],
-    toDOM () {
-      return codeDOM
-    }
+    parseDOM: [{ tag: "code" }],
+    toDOM() {
+      return codeDOM;
+    },
   },
   comment: {
     attrs: {
-      id: { default: null }
+      id: { default: null },
     },
-    exclude: '', // allow multiple "comments" marks to overlap
-    parseDOM: [{ tag: 'span' }],
-    toDOM () {
-      return commentDOM
-    }
+    exclude: "", // allow multiple "comments" marks to overlap
+    parseDOM: [{ tag: "span" }],
+    toDOM() {
+      return commentDOM;
+    },
   },
   ychange: {
     attrs: {
       user: { default: null },
-      state: { default: null }
+      type: { default: null },
     },
     inclusive: false,
-    parseDOM: [{ tag: 'ychange' }],
-    toDOM (node) {
+    parseDOM: [{ tag: "ychange" }],
+    toDOM(node) {
       return [
-        'ychange',
-        { ychange_user: node.attrs.user, ychange_state: node.attrs.state },
-        0
-      ]
-    }
-  }
+        "ychange",
+        { ychange_user: node.attrs.user, ychange_type: node.attrs.type },
+      ];
+    },
+  },
 };
 
 // :: Schema
@@ -11965,20 +12937,95 @@ const schema$1 = new PModel.Schema({ nodes, marks });
 const schema = /** @type {any} */ (basicSchema__namespace.schema);
 
 /**
+ * Verify that update events in plugins are only fired once.
+ *
+ * Initially reported in https://github.com/yjs/y-prosemirror/issues/121
+ *
+ * @param {t.TestCase} _tc
+ */
+const testPluginIntegrity = (_tc) => {
+  const ydoc = new Doc();
+  let viewUpdateEvents = 0;
+  let stateUpdateEvents = 0;
+  const customPlugin = new prosemirrorState.Plugin({
+    state: {
+      init: () => {
+        return {}
+      },
+      apply: () => {
+        stateUpdateEvents++;
+      }
+    },
+    view: () => {
+      return {
+        update () {
+          viewUpdateEvents++;
+        }
+      }
+    }
+  });
+  const view = new prosemirrorView.EditorView(null, {
+    // @ts-ignore
+    state: prosemirrorState.EditorState.create({
+      schema,
+      plugins: [
+        ySyncPlugin(ydoc.get('prosemirror', YXmlFragment)),
+        yUndoPlugin(),
+        customPlugin
+      ]
+    })
+  });
+  view.dispatch(
+    view.state.tr.insert(
+      0,
+      /** @type {any} */ (schema.node(
+        'paragraph',
+        undefined,
+        schema.text('hello world')
+      ))
+    )
+  );
+  t__namespace.compare({ viewUpdateEvents, stateUpdateEvents }, {
+    viewUpdateEvents: 1,
+    stateUpdateEvents: 2 // fired twice, because the ySyncPlugin adds additional fields to state after the initial render
+  }, 'events are fired only once');
+};
+
+/**
  * @param {t.TestCase} tc
  */
-const testDocTransformation = tc => {
+const testDocTransformation = (_tc) => {
   const view = createNewProsemirrorView(new Doc());
-  view.dispatch(view.state.tr.insert(0, /** @type {any} */ (schema.node('paragraph', undefined, schema.text('hello world')))));
+  view.dispatch(
+    view.state.tr.insert(
+      0,
+      /** @type {any} */ (schema.node(
+        'paragraph',
+        undefined,
+        schema.text('hello world')
+      ))
+    )
+  );
   const stateJSON = view.state.doc.toJSON();
   // test if transforming back and forth from Yjs doc works
-  const backandforth = yDocToProsemirrorJSON(prosemirrorJSONToYDoc(/** @type {any} */ (schema), stateJSON));
+  const backandforth = yDocToProsemirrorJSON(
+    prosemirrorJSONToYDoc(/** @type {any} */ (schema), stateJSON)
+  );
   t__namespace.compare(stateJSON, backandforth);
 };
 
-const testXmlFragmentTransformation = tc => {
+const testXmlFragmentTransformation = (_tc) => {
   const view = createNewProsemirrorView(new Doc());
-  view.dispatch(view.state.tr.insert(0, /** @type {any} */ (schema.node('paragraph', undefined, schema.text('hello world')))));
+  view.dispatch(
+    view.state.tr.insert(
+      0,
+      /** @type {any} */ (schema.node(
+        'paragraph',
+        undefined,
+        schema.text('hello world')
+      ))
+    )
+  );
   const stateJSON = view.state.doc.toJSON();
   console.log(JSON.stringify(stateJSON));
   // test if transforming back and forth from yXmlFragment works
@@ -11991,10 +13038,40 @@ const testXmlFragmentTransformation = tc => {
   t__namespace.compare(stateJSON, backandforth);
 };
 
+const testChangeOrigin = (_tc) => {
+  const ydoc = new Doc();
+  const yXmlFragment = ydoc.get('prosemirror', YXmlFragment);
+  const yundoManager = new UndoManager(yXmlFragment, { trackedOrigins: new Set(['trackme']) });
+  const view = createNewProsemirrorView(ydoc);
+  view.dispatch(
+    view.state.tr.insert(
+      0,
+      /** @type {any} */ (schema.node(
+        'paragraph',
+        undefined,
+        schema.text('world')
+      ))
+    )
+  );
+  const ysyncState1 = ySyncPluginKey.getState(view.state);
+  t__namespace.assert(ysyncState1.isChangeOrigin === false);
+  t__namespace.assert(ysyncState1.isUndoRedoOperation === false);
+  ydoc.transact(() => {
+    yXmlFragment.get(0).get(0).insert(0, 'hello');
+  }, 'trackme');
+  const ysyncState2 = ySyncPluginKey.getState(view.state);
+  t__namespace.assert(ysyncState2.isChangeOrigin === true);
+  t__namespace.assert(ysyncState2.isUndoRedoOperation === false);
+  yundoManager.undo();
+  const ysyncState3 = ySyncPluginKey.getState(view.state);
+  t__namespace.assert(ysyncState3.isChangeOrigin === true);
+  t__namespace.assert(ysyncState3.isUndoRedoOperation === true);
+};
+
 /**
  * @param {t.TestCase} tc
  */
-const testDuplicateMarks = tc => {
+const testEmptyNotSync = (_tc) => {
   const ydoc = new Doc();
   const type = ydoc.getXmlFragment('prosemirror');
   const view = createNewComplexProsemirrorView(ydoc);
@@ -12005,73 +13082,308 @@ const testDuplicateMarks = tc => {
       checked: true
     })
   );
-
-  const marks = [schema$1.mark('comment', { id: 0 }), schema$1.mark('comment', { id: 1 })];
-  view.dispatch(view.state.tr.insert(view.state.doc.content.size - 1, /** @type {any} */ schema$1.text('hello world', marks)));
-  const stateJSON = view.state.doc.toJSON();
-
-  // test if transforming back and forth from Yjs doc works
-  const backandforth = yDocToProsemirrorJSON(prosemirrorJSONToYDoc(/** @type {any} */ (schema$1), stateJSON));
-
-  // TODO: I think the duplicate marks work, but I think this fails because
-  // there is a yChange on stateJSON.content[1] (and not on backandforth)
-  t__namespace.compare(stateJSON, backandforth);
-
-  // TODO: create a toString test, this currently fails because YXmlText breaks
-  // t.compareStrings(type.toString(), '<custom checked="true"></custom><paragraph></paragraph>')
-};
-
-/**
- * @param {t.TestCase} tc
- */
-const testEmptyNotSync = tc => {
-  const ydoc = new Doc();
-  const type = ydoc.getXmlFragment('prosemirror');
-  const view = createNewComplexProsemirrorView(ydoc);
-  t__namespace.assert(type.toString() === '', 'should only sync after first change');
-
-  view.dispatch(
-    view.state.tr.setNodeMarkup(0, undefined, {
-      checked: true
-    })
+  t__namespace.compareStrings(
+    type.toString(),
+    '<custom checked="true"></custom><paragraph></paragraph>'
   );
-  t__namespace.compareStrings(type.toString(), '<custom checked="true"></custom><paragraph></paragraph>');
 };
 
 /**
  * @param {t.TestCase} tc
  */
-const testEmptyParagraph = tc => {
+const testEmptyParagraph = (_tc) => {
   const ydoc = new Doc();
   const view = createNewProsemirrorView(ydoc);
-  view.dispatch(view.state.tr.insert(0, /** @type {any} */ (schema.node('paragraph', undefined, schema.text('123')))));
+  view.dispatch(
+    view.state.tr.insert(
+      0,
+      /** @type {any} */ (schema.node(
+        'paragraph',
+        undefined,
+        schema.text('123')
+      ))
+    )
+  );
   const yxml = ydoc.get('prosemirror');
-  t__namespace.assert(yxml.length === 2 && yxml.get(0).length === 1, 'contains one paragraph containing a ytext');
+  t__namespace.assert(
+    yxml.length === 2 && yxml.get(0).length === 1,
+    'contains one paragraph containing a ytext'
+  );
   view.dispatch(view.state.tr.delete(1, 4)); // delete characters 123
-  t__namespace.assert(yxml.length === 2 && yxml.get(0).length === 1, 'doesn\'t delete the ytext');
+  t__namespace.assert(
+    yxml.length === 2 && yxml.get(0).length === 1,
+    "doesn't delete the ytext"
+  );
 };
 
-const createNewComplexProsemirrorView = y => {
-  const view = new prosemirrorView.EditorView(null, {
-    // @ts-ignore
-    state: prosemirrorState.EditorState.create({
-      schema: schema$1,
-      plugins: [ySyncPlugin(y.get('prosemirror', YXmlFragment))]
-    })
+/**
+ * Test duplication issue https://github.com/yjs/y-prosemirror/issues/161
+ *
+ * @param {t.TestCase} tc
+ */
+const testInsertDuplication = (_tc) => {
+  const ydoc1 = new Doc();
+  ydoc1.clientID = 1;
+  const ydoc2 = new Doc();
+  ydoc2.clientID = 2;
+  const view1 = createNewProsemirrorView(ydoc1);
+  const view2 = createNewProsemirrorView(ydoc2);
+  const yxml1 = ydoc1.getXmlFragment('prosemirror');
+  const yxml2 = ydoc2.getXmlFragment('prosemirror');
+  yxml1.observeDeep(events => {
+    events.forEach(event => {
+      console.log('yxml1: ', JSON.stringify(event.changes.delta));
+    });
   });
-  return view
+  yxml2.observeDeep(events => {
+    events.forEach(event => {
+      console.log('yxml2: ', JSON.stringify(event.changes.delta));
+    });
+  });
+  view1.dispatch(
+    view1.state.tr.insert(
+      0,
+      /** @type {any} */ (schema.node(
+        'paragraph'
+      ))
+    )
+  );
+  const sync = () => {
+    applyUpdate(ydoc2, encodeStateAsUpdate(ydoc1));
+    applyUpdate(ydoc1, encodeStateAsUpdate(ydoc2));
+    applyUpdate(ydoc2, encodeStateAsUpdate(ydoc1));
+    applyUpdate(ydoc1, encodeStateAsUpdate(ydoc2));
+  };
+  sync();
+  view1.dispatch(view1.state.tr.insertText('1', 1, 1));
+  view2.dispatch(view2.state.tr.insertText('2', 1, 1));
+  sync();
+  view1.dispatch(view1.state.tr.insertText('1', 2, 2));
+  view2.dispatch(view2.state.tr.insertText('2', 3, 3));
+  sync();
+  checkResult({ testObjects: [view1, view2] });
+  t__namespace.assert(yxml1.toString() === '<paragraph>1122</paragraph><paragraph></paragraph>');
 };
 
-const createNewProsemirrorView = y => {
+const testAddToHistory = (_tc) => {
+  const ydoc = new Doc();
+  const view = createNewProsemirrorViewWithUndoManager(ydoc);
+  view.dispatch(
+    view.state.tr.insert(
+      0,
+      /** @type {any} */ (schema.node(
+        'paragraph',
+        undefined,
+        schema.text('123')
+      ))
+    )
+  );
+  const yxml = ydoc.get('prosemirror');
+  t__namespace.assert(
+    yxml.length === 2 && yxml.get(0).length === 1,
+    'contains inserted content'
+  );
+  undo(view.state);
+  t__namespace.assert(yxml.length === 0, 'insertion was undone');
+  redo(view.state);
+  t__namespace.assert(
+    yxml.length === 2 && yxml.get(0).length === 1,
+    'contains inserted content'
+  );
+  undo(view.state);
+  t__namespace.assert(yxml.length === 0, 'insertion was undone');
+  // now insert content again, but with `'addToHistory': false`
+  view.dispatch(
+    view.state.tr.insert(
+      0,
+      /** @type {any} */ (schema.node(
+        'paragraph',
+        undefined,
+        schema.text('123')
+      ))
+    ).setMeta('addToHistory', false)
+  );
+  t__namespace.assert(
+    yxml.length === 2 && yxml.get(0).length === 1,
+    'contains inserted content'
+  );
+  undo(view.state);
+  t__namespace.assert(
+    yxml.length === 2 && yxml.get(0).length === 1,
+    'insertion was *not* undone'
+  );
+};
+
+/**
+ * Tests for #126 - initial cursor position should be retained, not jump to the end.
+ *
+ * @param {t.TestCase} _tc
+ */
+const testInitialCursorPosition = async (_tc) => {
+  const ydoc = new Doc();
+  const yxml = ydoc.get('prosemirror', YXmlFragment);
+  const p = new YXmlElement('paragraph');
+  p.insert(0, [new YXmlText('hello world!')]);
+  yxml.insert(0, [p]);
+  console.log('yxml', yxml.toString());
+  const view = createNewProsemirrorView(ydoc);
+  view.focus();
+  await promise__namespace.wait(10);
+  console.log('anchor', view.state.selection.anchor);
+  t__namespace.assert(view.state.selection.anchor === 1);
+  t__namespace.assert(view.state.selection.head === 1);
+};
+
+const testInitialCursorPosition2 = async (_tc) => {
+  const ydoc = new Doc();
+  const yxml = ydoc.get('prosemirror', YXmlFragment);
+  console.log('yxml', yxml.toString());
+  const view = createNewProsemirrorView(ydoc);
+  view.focus();
+  await promise__namespace.wait(10);
+  const p = new YXmlElement('paragraph');
+  p.insert(0, [new YXmlText('hello world!')]);
+  yxml.insert(0, [p]);
+  console.log('anchor', view.state.selection.anchor);
+  t__namespace.assert(view.state.selection.anchor === 0);
+  t__namespace.assert(view.state.selection.head === 0);
+};
+
+const testVersioning = async (_tc) => {
+  const ydoc = new Doc({ gc: false });
+  const yxml = ydoc.get('prosemirror', YXmlFragment);
+  const permanentUserData = new PermanentUserData(ydoc);
+  permanentUserData.setUserMapping(ydoc, ydoc.clientID, 'me');
+  ydoc.gc = false;
+  console.log('yxml', yxml.toString());
+  const view = createNewComplexProsemirrorView(ydoc);
+  const p = new YXmlElement('paragraph');
+  const ytext = new YXmlText('hello world!');
+  p.insert(0, [ytext]);
+  yxml.insert(0, [p]);
+  const snapshot1 = snapshot(ydoc);
+  const snapshotDoc1 = encodeStateAsUpdateV2(ydoc);
+  ytext.delete(0, 6);
+  const snapshot2 = snapshot(ydoc);
+  const snapshotDoc2 = encodeStateAsUpdateV2(ydoc);
+  view.dispatch(
+    view.state.tr.setMeta(ySyncPluginKey, { snapshot: snapshot2, prevSnapshot: snapshot1, permanentUserData })
+  );
+  await promise__namespace.wait(50);
+  console.log('calculated diff via snapshots: ', view.state.doc.toJSON());
+  // recreate the JSON, because ProseMirror messes with the constructors
+  const viewstate1 = JSON.parse(JSON.stringify(view.state.doc.toJSON().content[1].content));
+  const expectedState = [{
+    type: 'text',
+    marks: [{ type: 'ychange', attrs: { user: 'me', type: 'removed' } }],
+    text: 'hello '
+  }, {
+    type: 'text',
+    text: 'world!'
+  }];
+  console.log('calculated diff via snapshots: ', JSON.stringify(viewstate1));
+  t__namespace.compare(viewstate1, expectedState);
+
+  t__namespace.info('now check whether we get the same result when rendering the updates');
+  view.dispatch(
+    view.state.tr.setMeta(ySyncPluginKey, { snapshot: snapshotDoc2, prevSnapshot: snapshotDoc1, permanentUserData })
+  );
+  await promise__namespace.wait(50);
+
+  const viewstate2 = JSON.parse(JSON.stringify(view.state.doc.toJSON().content[1].content));
+  console.log('calculated diff via updates: ', JSON.stringify(viewstate2));
+  t__namespace.compare(viewstate2, expectedState);
+};
+
+const testAddToHistoryIgnore = (_tc) => {
+  const ydoc = new Doc();
+  const view = createNewProsemirrorViewWithUndoManager(ydoc);
+  // perform two changes that are tracked by um - supposed to be merged into a single undo-manager item
+  view.dispatch(
+    view.state.tr.insert(
+      0,
+      /** @type {any} */ (schema.node(
+        'paragraph',
+        undefined,
+        schema.text('123')
+      ))
+    )
+  );
+  view.dispatch(
+    view.state.tr.insert(
+      0,
+      /** @type {any} */ (schema.node(
+        'paragraph',
+        undefined,
+        schema.text('456')
+      ))
+    )
+  );
+  const yxml = ydoc.get('prosemirror');
+  t__namespace.assert(
+    yxml.length === 3 && yxml.get(0).length === 1,
+    'contains inserted content (1)'
+  );
+  view.dispatch(
+    view.state.tr.insert(
+      0,
+      /** @type {any} */ (schema.node(
+        'paragraph',
+        undefined,
+        schema.text('abc')
+      ))
+    ).setMeta('addToHistory', false)
+  );
+  t__namespace.assert(
+    yxml.length === 4 && yxml.get(0).length === 1,
+    'contains inserted content (2)'
+  );
+  view.dispatch(
+    view.state.tr.insert(
+      0,
+      /** @type {any} */ (schema.node(
+        'paragraph',
+        undefined,
+        schema.text('xyz')
+      ))
+    )
+  );
+  t__namespace.assert(
+    yxml.length === 5 && yxml.get(0).length === 1,
+    'contains inserted content (3)'
+  );
+  undo(view.state);
+  t__namespace.assert(yxml.length === 4, 'insertion (3) was undone');
+  undo(view.state);
+  console.log(yxml.toString());
+  t__namespace.assert(
+    yxml.length === 1 &&
+      yxml.get(0).toString() === '<paragraph>abc</paragraph>',
+    'insertion (1) was undone'
+  );
+};
+
+const createNewProsemirrorViewWithSchema = (y, schema, undoManager = false) => {
   const view = new prosemirrorView.EditorView(null, {
     // @ts-ignore
     state: prosemirrorState.EditorState.create({
       schema,
-      plugins: [ySyncPlugin(y.get('prosemirror', YXmlFragment))]
+      plugins: [ySyncPlugin(y.get('prosemirror', YXmlFragment))].concat(
+        undoManager ? [yUndoPlugin()] : []
+      )
     })
   });
   return view
 };
+
+const createNewComplexProsemirrorView = (y, undoManager = false) =>
+  createNewProsemirrorViewWithSchema(y, schema$1, undoManager);
+
+const createNewProsemirrorView = (y) =>
+  createNewProsemirrorViewWithSchema(y, schema, false);
+
+const createNewProsemirrorViewWithUndoManager = (y) =>
+  createNewProsemirrorViewWithSchema(y, schema, true);
 
 let charCounter = 0;
 
@@ -12089,7 +13401,7 @@ const pmChanges = [
    * @param {prng.PRNG} gen
    * @param {EditorView} p
    */
-  (y, gen, p) => { // insert text
+  (_y, gen, p) => { // insert text
     const insertPos = prng__namespace.int32(gen, 0, p.state.doc.content.size);
     const marks = prng__namespace.oneOf(gen, marksChoices);
     const tr = p.state.tr;
@@ -12101,9 +13413,12 @@ const pmChanges = [
    * @param {prng.PRNG} gen
    * @param {EditorView} p
    */
-  (y, gen, p) => { // delete text
+  (_y, gen, p) => { // delete text
     const insertPos = prng__namespace.int32(gen, 0, p.state.doc.content.size);
-    const overwrite = math__namespace.min(prng__namespace.int32(gen, 0, p.state.doc.content.size - insertPos), 2);
+    const overwrite = math__namespace.min(
+      prng__namespace.int32(gen, 0, p.state.doc.content.size - insertPos),
+      2
+    );
     p.dispatch(p.state.tr.insertText('', insertPos, insertPos + overwrite));
   },
   /**
@@ -12111,9 +13426,12 @@ const pmChanges = [
    * @param {prng.PRNG} gen
    * @param {EditorView} p
    */
-  (y, gen, p) => { // replace text
+  (_y, gen, p) => { // replace text
     const insertPos = prng__namespace.int32(gen, 0, p.state.doc.content.size);
-    const overwrite = math__namespace.min(prng__namespace.int32(gen, 0, p.state.doc.content.size - insertPos), 2);
+    const overwrite = math__namespace.min(
+      prng__namespace.int32(gen, 0, p.state.doc.content.size - insertPos),
+      2
+    );
     const text = charCounter++ + prng__namespace.word(gen);
     p.dispatch(p.state.tr.insertText(text, insertPos, insertPos + overwrite));
   },
@@ -12122,34 +13440,46 @@ const pmChanges = [
    * @param {prng.PRNG} gen
    * @param {EditorView} p
    */
-  (y, gen, p) => { // insert paragraph
+  (_y, gen, p) => { // insert paragraph
     const insertPos = prng__namespace.int32(gen, 0, p.state.doc.content.size);
     const marks = prng__namespace.oneOf(gen, marksChoices);
     const tr = p.state.tr;
     const text = charCounter++ + prng__namespace.word(gen);
-    p.dispatch(tr.insert(insertPos, schema.node('paragraph', undefined, schema.text(text, marks))));
+    p.dispatch(
+      tr.insert(
+        insertPos,
+        schema.node('paragraph', undefined, schema.text(text, marks))
+      )
+    );
   },
   /**
    * @param {Y.Doc} y
    * @param {prng.PRNG} gen
    * @param {EditorView} p
    */
-  (y, gen, p) => { // insert codeblock
+  (_y, gen, p) => { // insert codeblock
     const insertPos = prng__namespace.int32(gen, 0, p.state.doc.content.size);
     const tr = p.state.tr;
     const text = charCounter++ + prng__namespace.word(gen);
-    p.dispatch(tr.insert(insertPos, schema.node('code_block', undefined, schema.text(text))));
+    p.dispatch(
+      tr.insert(
+        insertPos,
+        schema.node('code_block', undefined, schema.text(text))
+      )
+    );
   },
   /**
    * @param {Y.Doc} y
    * @param {prng.PRNG} gen
    * @param {EditorView} p
    */
-  (y, gen, p) => { // wrap in blockquote
+  (_y, gen, p) => { // wrap in blockquote
     const insertPos = prng__namespace.int32(gen, 0, p.state.doc.content.size);
     const overwrite = prng__namespace.int32(gen, 0, p.state.doc.content.size - insertPos);
     const tr = p.state.tr;
-    tr.setSelection(prosemirrorState.TextSelection.create(tr.doc, insertPos, insertPos + overwrite));
+    tr.setSelection(
+      prosemirrorState.TextSelection.create(tr.doc, insertPos, insertPos + overwrite)
+    );
     const $from = tr.selection.$from;
     const $to = tr.selection.$to;
     const range = $from.blockRange($to);
@@ -12163,7 +13493,7 @@ const pmChanges = [
 /**
  * @param {any} result
  */
-const checkResult = result => {
+const checkResult = (result) => {
   for (let i = 1; i < result.testObjects.length; i++) {
     const p1 = result.testObjects[i - 1].state.doc.toJSON();
     const p2 = result.testObjects[i].state.doc.toJSON();
@@ -12174,35 +13504,35 @@ const checkResult = result => {
 /**
  * @param {t.TestCase} tc
  */
-const testRepeatGenerateProsemirrorChanges2 = tc => {
+const testRepeatGenerateProsemirrorChanges2 = (tc) => {
   checkResult(applyRandomTests(tc, pmChanges, 2, createNewProsemirrorView));
 };
 
 /**
  * @param {t.TestCase} tc
  */
-const testRepeatGenerateProsemirrorChanges3 = tc => {
+const testRepeatGenerateProsemirrorChanges3 = (tc) => {
   checkResult(applyRandomTests(tc, pmChanges, 3, createNewProsemirrorView));
 };
 
 /**
  * @param {t.TestCase} tc
  */
-const testRepeatGenerateProsemirrorChanges30 = tc => {
+const testRepeatGenerateProsemirrorChanges30 = (tc) => {
   checkResult(applyRandomTests(tc, pmChanges, 30, createNewProsemirrorView));
 };
 
 /**
  * @param {t.TestCase} tc
  */
-const testRepeatGenerateProsemirrorChanges40 = tc => {
+const testRepeatGenerateProsemirrorChanges40 = (tc) => {
   checkResult(applyRandomTests(tc, pmChanges, 40, createNewProsemirrorView));
 };
 
 /**
  * @param {t.TestCase} tc
  */
-const testRepeatGenerateProsemirrorChanges70 = tc => {
+const testRepeatGenerateProsemirrorChanges70 = (tc) => {
   checkResult(applyRandomTests(tc, pmChanges, 70, createNewProsemirrorView));
 };
 
@@ -12223,11 +13553,18 @@ export const testRepeatGenerateProsemirrorChanges300 = tc => {
 
 var prosemirror = /*#__PURE__*/Object.freeze({
   __proto__: null,
+  testPluginIntegrity: testPluginIntegrity,
   testDocTransformation: testDocTransformation,
   testXmlFragmentTransformation: testXmlFragmentTransformation,
-  testDuplicateMarks: testDuplicateMarks,
+  testChangeOrigin: testChangeOrigin,
   testEmptyNotSync: testEmptyNotSync,
   testEmptyParagraph: testEmptyParagraph,
+  testInsertDuplication: testInsertDuplication,
+  testAddToHistory: testAddToHistory,
+  testInitialCursorPosition: testInitialCursorPosition,
+  testInitialCursorPosition2: testInitialCursorPosition2,
+  testVersioning: testVersioning,
+  testAddToHistoryIgnore: testAddToHistoryIgnore,
   testRepeatGenerateProsemirrorChanges2: testRepeatGenerateProsemirrorChanges2,
   testRepeatGenerateProsemirrorChanges3: testRepeatGenerateProsemirrorChanges3,
   testRepeatGenerateProsemirrorChanges30: testRepeatGenerateProsemirrorChanges30,
@@ -12237,7 +13574,9 @@ var prosemirror = /*#__PURE__*/Object.freeze({
 
 // @ts-nocheck
 
-const documentContent = fs__default["default"].readFileSync(path__default["default"].join(__dirname, '../test.html'));
+// eslint-disable-next-line
+const __dirname$1 = path.dirname(url.fileURLToPath((typeof document === 'undefined' ? new (require('u' + 'rl').URL)('file:' + __filename).href : (document.currentScript && document.currentScript.src || new URL('test.cjs', document.baseURI).href)))); // eslint-disable-line
+const documentContent = fs__default["default"].readFileSync(path__default["default"].join(__dirname$1, '../test.html'));
 const { window: window$1 } = new jsdom__default["default"].JSDOM(documentContent);
 
 global.window = window$1;

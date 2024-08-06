@@ -78,7 +78,13 @@ const yCursorPluginKey = new prosemirrorState.PluginKey('yjs-cursor');
  * @param {Y.Item} item
  * @param {Y.Snapshot} [snapshot]
  */
-const isVisible = (item, snapshot) => snapshot === undefined ? !item.deleted : (snapshot.sv.has(item.id.client) && /** @type {number} */ (snapshot.sv.get(item.id.client)) > item.id.clock && !Y__namespace.isDeleted(snapshot.ds, item.id));
+const isVisible = (item, snapshot) =>
+  snapshot === undefined
+    ? !item.deleted
+    : snapshot.sv.has(item.id.client) &&
+      /** @type {number} */
+      (snapshot.sv.get(item.id.client)) > item.id.clock &&
+      !Y__namespace.isDeleted(snapshot.ds, item.id);
 
 /**
  * Either a node if type is YXmlElement or an Array of text nodes if YXmlText
@@ -96,13 +102,14 @@ const isVisible = (item, snapshot) => snapshot === undefined ? !item.deleted : (
  * @property {Array<ColorDef>} [YSyncOpts.colors]
  * @property {Map<string,ColorDef>} [YSyncOpts.colorMapping]
  * @property {Y.PermanentUserData|null} [YSyncOpts.permanentUserData]
+ * @property {ProsemirrorMapping} [YSyncOpts.mapping]
  * @property {function} [YSyncOpts.onFirstRender] Fired when the content from Yjs is initially rendered to ProseMirror
  */
 
 /**
  * @type {Array<ColorDef>}
  */
-const defaultColors = [{ light: '#ecd44433', dark: '#ecd444' }];
+const defaultColors = [{ light: "#ecd44433", dark: "#ecd444" }];
 
 /**
  * @param {Map<string,ColorDef>} colorMapping
@@ -115,12 +122,12 @@ const getUserColor = (colorMapping, colors, user) => {
   if (!colorMapping.has(user)) {
     if (colorMapping.size < colors.length) {
       const usedColors = set__namespace.create();
-      colorMapping.forEach(color => usedColors.add(color));
-      colors = colors.filter(color => !usedColors.has(color));
+      colorMapping.forEach((color) => usedColors.add(color));
+      colors = colors.filter((color) => !usedColors.has(color));
     }
     colorMapping.set(user, random__namespace.oneOf(colors));
   }
-  return /** @type {ColorDef} */ (colorMapping.get(user))
+  return /** @type {ColorDef} */ (colorMapping.get(user));
 };
 
 /**
@@ -131,35 +138,44 @@ const getUserColor = (colorMapping, colors, user) => {
  * @param {YSyncOpts} opts
  * @return {any} Returns a prosemirror plugin that binds to this type
  */
-const ySyncPlugin = (yXmlFragment, {
-  colors = defaultColors,
-  colorMapping = new Map(),
-  permanentUserData = null,
-  onFirstRender = () => {}
-} = {}) => {
-  let changedInitialContent = false;
-  let rerenderTimeoutId;
+const ySyncPlugin = (
+  yXmlFragment,
+  {
+    colors = defaultColors,
+    colorMapping = new Map(),
+    permanentUserData = null,
+    onFirstRender = () => {},
+    mapping,
+  } = {},
+) => {
+  let initialContentChanged = false;
+  const binding = new ProsemirrorBinding(yXmlFragment, mapping);
   const plugin = new prosemirrorState.Plugin({
     props: {
       editable: (state) => {
         const syncState = ySyncPluginKey.getState(state);
-        return syncState.snapshot == null && syncState.prevSnapshot == null
-      }
+        return syncState.snapshot == null && syncState.prevSnapshot == null;
+      },
     },
     key: ySyncPluginKey,
     state: {
-      init: (initargs, state) => {
+      /**
+       * @returns {any}
+       */
+      init: (_initargs, _state) => {
         return {
           type: yXmlFragment,
           doc: yXmlFragment.doc,
-          binding: null,
+          binding,
           snapshot: null,
           prevSnapshot: null,
           isChangeOrigin: false,
+          isUndoRedoOperation: false,
+          addToHistory: true,
           colors,
           colorMapping,
-          permanentUserData
-        }
+          permanentUserData,
+        };
       },
       apply: (tr, pluginState) => {
         const change = tr.getMeta(ySyncPluginKey);
@@ -169,60 +185,105 @@ const ySyncPlugin = (yXmlFragment, {
             pluginState[key] = change[key];
           }
         }
+        pluginState.addToHistory = tr.getMeta("addToHistory") !== false;
         // always set isChangeOrigin. If undefined, this is not change origin.
-        pluginState.isChangeOrigin = change !== undefined && !!change.isChangeOrigin;
-        if (pluginState.binding !== null) {
-          if (change !== undefined && (change.snapshot != null || change.prevSnapshot != null)) {
+        pluginState.isChangeOrigin =
+          change !== undefined && !!change.isChangeOrigin;
+        pluginState.isUndoRedoOperation =
+          change !== undefined &&
+          !!change.isChangeOrigin &&
+          !!change.isUndoRedoOperation;
+        if (binding.prosemirrorView !== null) {
+          if (
+            change !== undefined &&
+            (change.snapshot != null || change.prevSnapshot != null)
+          ) {
             // snapshot changed, rerender next
             eventloop__namespace.timeout(0, () => {
-              if (pluginState.binding == null || pluginState.binding.isDestroyed) {
-                return
+              if (binding.prosemirrorView == null) {
+                return;
               }
               if (change.restore == null) {
-                pluginState.binding._renderSnapshot(change.snapshot, change.prevSnapshot, pluginState);
+                binding._renderSnapshot(
+                  change.snapshot,
+                  change.prevSnapshot,
+                  pluginState,
+                );
               } else {
-                pluginState.binding._renderSnapshot(change.snapshot, change.snapshot, pluginState);
+                binding._renderSnapshot(
+                  change.snapshot,
+                  change.snapshot,
+                  pluginState,
+                );
                 // reset to current prosemirror state
                 delete pluginState.restore;
                 delete pluginState.snapshot;
                 delete pluginState.prevSnapshot;
-                pluginState.binding._prosemirrorChanged(pluginState.binding.prosemirrorView.state.doc);
+                binding.mux(() => {
+                  binding._prosemirrorChanged(
+                    binding.prosemirrorView.state.doc,
+                  );
+                });
               }
             });
           }
         }
-        return pluginState
-      }
+        return pluginState;
+      },
     },
-    view: view => {
-      const binding = new ProsemirrorBinding(yXmlFragment, view);
-      if (rerenderTimeoutId != null) {
-        clearTimeout(rerenderTimeoutId);
-      }
-      // Make sure this is called in a separate context
-      rerenderTimeoutId = eventloop__namespace.timeout(0, () => {
+    view: (view) => {
+      binding.initView(view);
+      if (mapping == null) {
+        // force rerender to update the bindings mapping
         binding._forceRerender();
-        view.dispatch(view.state.tr.setMeta(ySyncPluginKey, { binding }));
-        onFirstRender();
-      });
+      }
+      onFirstRender();
       return {
         update: () => {
           const pluginState = plugin.getState(view.state);
-          if (pluginState.snapshot == null && pluginState.prevSnapshot == null) {
-            if (changedInitialContent || view.state.doc.content.findDiffStart(view.state.doc.type.createAndFill().content) !== null) {
-              changedInitialContent = true;
-              binding._prosemirrorChanged(view.state.doc);
+          if (
+            pluginState.snapshot == null &&
+            pluginState.prevSnapshot == null
+          ) {
+            if (
+              // If the content doesn't change initially, we don't render anything to Yjs
+              // If the content was cleared by a user action, we want to catch the change and
+              // represent it in Yjs
+              initialContentChanged ||
+              view.state.doc.content.findDiffStart(
+                view.state.doc.type.createAndFill().content,
+              ) !== null
+            ) {
+              initialContentChanged = true;
+              if (
+                pluginState.addToHistory === false &&
+                !pluginState.isChangeOrigin
+              ) {
+                const yUndoPluginState = yUndoPluginKey.getState(view.state);
+                /**
+                 * @type {Y.UndoManager}
+                 */
+                const um = yUndoPluginState && yUndoPluginState.undoManager;
+                if (um) {
+                  um.stopCapturing();
+                }
+              }
+              binding.mux(() => {
+                /** @type {Y.Doc} */ (pluginState.doc).transact((tr) => {
+                  tr.meta.set("addToHistory", pluginState.addToHistory);
+                  binding._prosemirrorChanged(view.state.doc);
+                }, ySyncPluginKey);
+              });
             }
           }
         },
         destroy: () => {
-          clearTimeout(rerenderTimeoutId);
           binding.destroy();
-        }
-      }
-    }
+        },
+      };
+    },
   });
-  return plugin
+  return plugin;
 };
 
 /**
@@ -232,8 +293,18 @@ const ySyncPlugin = (yXmlFragment, {
  */
 const restoreRelativeSelection = (tr, relSel, binding) => {
   if (relSel !== null && relSel.anchor !== null && relSel.head !== null) {
-    const anchor = relativePositionToAbsolutePosition(binding.doc, binding.type, relSel.anchor, binding.mapping);
-    const head = relativePositionToAbsolutePosition(binding.doc, binding.type, relSel.head, binding.mapping);
+    const anchor = relativePositionToAbsolutePosition(
+      binding.doc,
+      binding.type,
+      relSel.anchor,
+      binding.mapping,
+    );
+    const head = relativePositionToAbsolutePosition(
+      binding.doc,
+      binding.type,
+      relSel.head,
+      binding.mapping,
+    );
     if (anchor !== null && head !== null) {
       tr = tr.setSelection(prosemirrorState.TextSelection.create(tr.doc, anchor, head));
     }
@@ -241,8 +312,16 @@ const restoreRelativeSelection = (tr, relSel, binding) => {
 };
 
 const getRelativeSelection = (pmbinding, state) => ({
-  anchor: absolutePositionToRelativePosition(state.selection.anchor, pmbinding.type, pmbinding.mapping),
-  head: absolutePositionToRelativePosition(state.selection.head, pmbinding.type, pmbinding.mapping)
+  anchor: absolutePositionToRelativePosition(
+    state.selection.anchor,
+    pmbinding.type,
+    pmbinding.mapping,
+  ),
+  head: absolutePositionToRelativePosition(
+    state.selection.head,
+    pmbinding.type,
+    pmbinding.mapping,
+  ),
 });
 
 /**
@@ -253,17 +332,17 @@ const getRelativeSelection = (pmbinding, state) => ({
 class ProsemirrorBinding {
   /**
    * @param {Y.XmlFragment} yXmlFragment The bind source
-   * @param {any} prosemirrorView The target binding
+   * @param {ProsemirrorMapping} mapping
    */
-  constructor (yXmlFragment, prosemirrorView) {
+  constructor(yXmlFragment, mapping = new Map()) {
     this.type = yXmlFragment;
-    this.prosemirrorView = prosemirrorView;
-    this.mux = mutex.createMutex();
-    this.isDestroyed = false;
     /**
-     * @type {ProsemirrorMapping}
+     * this will be set once the view is created
+     * @type {any}
      */
-    this.mapping = new Map();
+    this.prosemirrorView = null;
+    this.mux = mutex.createMutex();
+    this.mapping = mapping;
     this._observeFunction = this._typeChanged.bind(this);
     /**
      * @type {Y.Doc}
@@ -275,18 +354,19 @@ class ProsemirrorBinding {
      */
     this.beforeTransactionSelection = null;
     this.beforeAllTransactions = () => {
-      if (this.beforeTransactionSelection === null) {
-        this.beforeTransactionSelection = getRelativeSelection(this, prosemirrorView.state);
+      if (
+        this.beforeTransactionSelection === null &&
+        this.prosemirrorView != null
+      ) {
+        this.beforeTransactionSelection = getRelativeSelection(
+          this,
+          this.prosemirrorView.state,
+        );
       }
     };
     this.afterAllTransactions = () => {
       this.beforeTransactionSelection = null;
     };
-
-    this.doc.on('beforeAllTransactions', this.beforeAllTransactions);
-    this.doc.on('afterAllTransactions', this.afterAllTransactions);
-    yXmlFragment.observeDeep(this._observeFunction);
-
     this._domSelectionInView = null;
   }
 
@@ -295,12 +375,12 @@ class ProsemirrorBinding {
    *
    * @returns
    */
-  get _tr () {
-    return this.prosemirrorView.state.tr.setMeta('addToHistory', false)
+  get _tr() {
+    return this.prosemirrorView.state.tr.setMeta("addToHistory", false);
   }
 
-  _isLocalCursorInView () {
-    if (!this.prosemirrorView.hasFocus()) return false
+  _isLocalCursorInView() {
+    if (!this.prosemirrorView.hasFocus()) return false;
     if (environment__namespace.isBrowser && this._domSelectionInView === null) {
       // Calculate the domSelectionInView and clear by next tick after all events are finished
       eventloop__namespace.timeout(0, () => {
@@ -308,10 +388,10 @@ class ProsemirrorBinding {
       });
       this._domSelectionInView = this._isDomSelectionInView();
     }
-    return this._domSelectionInView
+    return this._domSelectionInView;
   }
 
-  _isDomSelectionInView () {
+  _isDomSelectionInView() {
     const selection = this.prosemirrorView._root.getSelection();
 
     const range = this.prosemirrorView._root.createRange();
@@ -332,81 +412,181 @@ class ProsemirrorBinding {
     const bounding = range.getBoundingClientRect();
     const documentElement = dom__namespace.doc.documentElement;
 
-    return bounding.bottom >= 0 && bounding.right >= 0 &&
-      bounding.left <= (window.innerWidth || documentElement.clientWidth || 0) &&
+    return (
+      bounding.bottom >= 0 &&
+      bounding.right >= 0 &&
+      bounding.left <=
+        (window.innerWidth || documentElement.clientWidth || 0) &&
       bounding.top <= (window.innerHeight || documentElement.clientHeight || 0)
-  }
-
-  renderSnapshot (snapshot, prevSnapshot) {
-    if (!prevSnapshot) {
-      prevSnapshot = Y__namespace.createSnapshot(Y__namespace.createDeleteSet(), new Map());
-    }
-    this.prosemirrorView.dispatch(this._tr.setMeta(ySyncPluginKey, { snapshot, prevSnapshot }));
-  }
-
-  unrenderSnapshot () {
-    this.mapping = new Map();
-    this.mux(() => {
-      const fragmentContent = this.type.toArray().map(t => createNodeFromYElement(/** @type {Y.XmlElement} */ (t), this.prosemirrorView.state.schema, this.mapping)).filter(n => n !== null);
-      // @ts-ignore
-      const tr = this._tr.replace(0, this.prosemirrorView.state.doc.content.size, new PModel__namespace.Slice(new PModel__namespace.Fragment(fragmentContent), 0, 0));
-      tr.setMeta(ySyncPluginKey, { snapshot: null, prevSnapshot: null });
-      this.prosemirrorView.dispatch(tr);
-    });
-  }
-
-  _forceRerender () {
-    this.mapping = new Map();
-    this.mux(() => {
-      const fragmentContent = this.type.toArray().map(t => createNodeFromYElement(/** @type {Y.XmlElement} */ (t), this.prosemirrorView.state.schema, this.mapping)).filter(n => n !== null);
-      // @ts-ignore
-      const tr = this._tr.replace(0, this.prosemirrorView.state.doc.content.size, new PModel__namespace.Slice(new PModel__namespace.Fragment(fragmentContent), 0, 0));
-      this.prosemirrorView.dispatch(tr.setMeta(ySyncPluginKey, { isChangeOrigin: true }));
-    });
+    );
   }
 
   /**
    * @param {Y.Snapshot} snapshot
    * @param {Y.Snapshot} prevSnapshot
+   */
+  renderSnapshot(snapshot, prevSnapshot) {
+    if (!prevSnapshot) {
+      prevSnapshot = Y__namespace.createSnapshot(Y__namespace.createDeleteSet(), new Map());
+    }
+    this.prosemirrorView.dispatch(
+      this._tr.setMeta(ySyncPluginKey, { snapshot, prevSnapshot }),
+    );
+  }
+
+  unrenderSnapshot() {
+    this.mapping.clear();
+    this.mux(() => {
+      const fragmentContent = this.type
+        .toArray()
+        .map((t) =>
+          createNodeFromYElement(
+            /** @type {Y.XmlElement} */ (t),
+            this.prosemirrorView.state.schema,
+            this.mapping,
+          ),
+        )
+        .filter((n) => n !== null);
+      // @ts-ignore
+      const tr = this._tr.replace(
+        0,
+        this.prosemirrorView.state.doc.content.size,
+        new PModel__namespace.Slice(PModel__namespace.Fragment.from(fragmentContent), 0, 0),
+      );
+      tr.setMeta(ySyncPluginKey, { snapshot: null, prevSnapshot: null });
+      this.prosemirrorView.dispatch(tr);
+    });
+  }
+
+  _forceRerender() {
+    this.mapping.clear();
+    this.mux(() => {
+      // If this is a forced rerender, this might neither happen as a pm change nor within a Yjs
+      // transaction. Then the "before selection" doesn't exist. In this case, we need to create a
+      // relative position before replacing content. Fixes #126
+      const sel =
+        this.beforeTransactionSelection !== null
+          ? null
+          : this.prosemirrorView.state.selection;
+      const fragmentContent = this.type
+        .toArray()
+        .map((t) =>
+          createNodeFromYElement(
+            /** @type {Y.XmlElement} */ (t),
+            this.prosemirrorView.state.schema,
+            this.mapping,
+          ),
+        )
+        .filter((n) => n !== null);
+      // @ts-ignore
+      const tr = this._tr.replace(
+        0,
+        this.prosemirrorView.state.doc.content.size,
+        new PModel__namespace.Slice(PModel__namespace.Fragment.from(fragmentContent), 0, 0),
+      );
+      if (sel) {
+        tr.setSelection(prosemirrorState.TextSelection.create(tr.doc, sel.anchor, sel.head));
+      }
+      this.prosemirrorView.dispatch(
+        tr.setMeta(ySyncPluginKey, { isChangeOrigin: true, binding: this }),
+      );
+    });
+  }
+
+  /**
+   * @param {Y.Snapshot|Uint8Array} snapshot
+   * @param {Y.Snapshot|Uint8Array} prevSnapshot
    * @param {Object} pluginState
    */
-  _renderSnapshot (snapshot, prevSnapshot, pluginState) {
+  _renderSnapshot(snapshot, prevSnapshot, pluginState) {
+    /**
+     * The document that contains the full history of this document.
+     * @type {Y.Doc}
+     */
+    let historyDoc = this.doc;
     if (!snapshot) {
       snapshot = Y__namespace.snapshot(this.doc);
     }
+    if (snapshot instanceof Uint8Array || prevSnapshot instanceof Uint8Array) {
+      if (
+        !(snapshot instanceof Uint8Array) ||
+        !(prevSnapshot instanceof Uint8Array)
+      ) {
+        // expected both snapshots to be v2 updates
+        error__namespace.unexpectedCase();
+      }
+      historyDoc = new Y__namespace.Doc({ gc: false });
+      Y__namespace.applyUpdateV2(historyDoc, prevSnapshot);
+      prevSnapshot = Y__namespace.snapshot(historyDoc);
+      Y__namespace.applyUpdateV2(historyDoc, snapshot);
+      snapshot = Y__namespace.snapshot(historyDoc);
+    }
     // clear mapping because we are going to rerender
-    this.mapping = new Map();
+    this.mapping.clear();
     this.mux(() => {
-      this.doc.transact(transaction => {
+      historyDoc.transact((transaction) => {
         // before rendering, we are going to sanitize ops and split deleted ops
         // if they were deleted by seperate users.
         const pud = pluginState.permanentUserData;
         if (pud) {
-          pud.dss.forEach(ds => {
-            Y__namespace.iterateDeletedStructs(transaction, ds, item => {});
+          pud.dss.forEach((ds) => {
+            Y__namespace.iterateDeletedStructs(transaction, ds, (_item) => {});
           });
         }
+        /**
+         * @param {'removed'|'added'} type
+         * @param {Y.ID} id
+         */
         const computeYChange = (type, id) => {
-          const user = type === 'added' ? pud.getUserByClientId(id.client) : pud.getUserByDeletedId(id);
+          const user =
+            type === "added"
+              ? pud.getUserByClientId(id.client)
+              : pud.getUserByDeletedId(id);
           return {
             user,
             type,
-            color: getUserColor(pluginState.colorMapping, pluginState.colors, user)
-          }
+            color: getUserColor(
+              pluginState.colorMapping,
+              pluginState.colors,
+              user,
+            ),
+          };
         };
         // Create document fragment and render
-        const fragmentContent = Y__namespace.typeListToArraySnapshot(this.type, new Y__namespace.Snapshot(prevSnapshot.ds, snapshot.sv)).map(t => {
-          if (!t._item.deleted || isVisible(t._item, snapshot) || isVisible(t._item, prevSnapshot)) {
-            return createNodeFromYElement(t, this.prosemirrorView.state.schema, new Map(), snapshot, prevSnapshot, computeYChange)
-          } else {
-            // No need to render elements that are not visible by either snapshot.
-            // If a client adds and deletes content in the same snapshot the element is not visible by either snapshot.
-            return null
-          }
-        }).filter(n => n !== null);
+        const fragmentContent = Y__namespace.typeListToArraySnapshot(
+          this.type,
+          new Y__namespace.Snapshot(prevSnapshot.ds, snapshot.sv),
+        )
+          .map((t) => {
+            if (
+              !t._item.deleted ||
+              isVisible(t._item, snapshot) ||
+              isVisible(t._item, prevSnapshot)
+            ) {
+              return createNodeFromYElement(
+                t,
+                this.prosemirrorView.state.schema,
+                new Map(),
+                snapshot,
+                prevSnapshot,
+                computeYChange,
+              );
+            } else {
+              // No need to render elements that are not visible by either snapshot.
+              // If a client adds and deletes content in the same snapshot the element is not visible by either snapshot.
+              return null;
+            }
+          })
+          .filter((n) => n !== null);
         // @ts-ignore
-        const tr = this._tr.replace(0, this.prosemirrorView.state.doc.content.size, new PModel__namespace.Slice(new PModel__namespace.Fragment(fragmentContent), 0, 0));
-        this.prosemirrorView.dispatch(tr.setMeta(ySyncPluginKey, { isChangeOrigin: true }));
+        const tr = this._tr.replace(
+          0,
+          this.prosemirrorView.state.doc.content.size,
+          new PModel__namespace.Slice(PModel__namespace.Fragment.from(fragmentContent), 0, 0),
+        );
+        this.prosemirrorView.dispatch(
+          tr.setMeta(ySyncPluginKey, { isChangeOrigin: true }),
+        );
       }, ySyncPluginKey);
     });
   }
@@ -415,12 +595,17 @@ class ProsemirrorBinding {
    * @param {Array<Y.YEvent<any>>} events
    * @param {Y.Transaction} transaction
    */
-  _typeChanged (events, transaction) {
+  _typeChanged(events, transaction) {
+    if (this.prosemirrorView == null) return;
     const syncState = ySyncPluginKey.getState(this.prosemirrorView.state);
-    if (events.length === 0 || syncState.snapshot != null || syncState.prevSnapshot != null) {
+    if (
+      events.length === 0 ||
+      syncState.snapshot != null ||
+      syncState.prevSnapshot != null
+    ) {
       // drop out if snapshot is active
       this.renderSnapshot(syncState.snapshot, syncState.prevSnapshot);
-      return
+      return;
     }
     this.mux(() => {
       /**
@@ -428,35 +613,75 @@ class ProsemirrorBinding {
        * @param {Y.AbstractType<any>} type
        */
       const delType = (_, type) => this.mapping.delete(type);
-      Y__namespace.iterateDeletedStructs(transaction, transaction.deleteSet, struct => struct.constructor === Y__namespace.Item && this.mapping.delete(/** @type {Y.ContentType} */ (/** @type {Y.Item} */ (struct).content).type));
+      Y__namespace.iterateDeletedStructs(transaction, transaction.deleteSet, (struct) => {
+        if (struct.constructor === Y__namespace.Item) {
+          const type = /** @type {Y.ContentType} */ (
+            /** @type {Y.Item} */ (struct).content
+          ).type;
+          type && this.mapping.delete(type);
+        }
+      });
       transaction.changed.forEach(delType);
       transaction.changedParentTypes.forEach(delType);
-      const fragmentContent = this.type.toArray().map(t => createNodeIfNotExists(/** @type {Y.XmlElement | Y.XmlHook} */ (t), this.prosemirrorView.state.schema, this.mapping)).filter(n => n !== null);
+      const fragmentContent = this.type
+        .toArray()
+        .map((t) =>
+          createNodeIfNotExists(
+            /** @type {Y.XmlElement | Y.XmlHook} */ (t),
+            this.prosemirrorView.state.schema,
+            this.mapping,
+          ),
+        )
+        .filter((n) => n !== null);
       // @ts-ignore
-      let tr = this._tr.replace(0, this.prosemirrorView.state.doc.content.size, new PModel__namespace.Slice(new PModel__namespace.Fragment(fragmentContent), 0, 0));
+      let tr = this._tr.replace(
+        0,
+        this.prosemirrorView.state.doc.content.size,
+        new PModel__namespace.Slice(PModel__namespace.Fragment.from(fragmentContent), 0, 0),
+      );
       restoreRelativeSelection(tr, this.beforeTransactionSelection, this);
-      tr = tr.setMeta(ySyncPluginKey, { isChangeOrigin: true });
-      if (this.beforeTransactionSelection !== null && this._isLocalCursorInView()) {
+      tr = tr.setMeta(ySyncPluginKey, {
+        isChangeOrigin: true,
+        isUndoRedoOperation: transaction.origin instanceof Y__namespace.UndoManager,
+      });
+      if (
+        this.beforeTransactionSelection !== null &&
+        this._isLocalCursorInView()
+      ) {
         tr.scrollIntoView();
       }
       this.prosemirrorView.dispatch(tr);
     });
   }
 
-  _prosemirrorChanged (doc) {
-    this.mux(() => {
-      this.doc.transact(() => {
-        updateYFragment(this.doc, this.type, doc, this.mapping);
-        this.beforeTransactionSelection = getRelativeSelection(this, this.prosemirrorView.state);
-      }, ySyncPluginKey);
-    });
+  _prosemirrorChanged(doc) {
+    this.doc.transact(() => {
+      updateYFragment(this.doc, this.type, doc, this.mapping);
+      this.beforeTransactionSelection = getRelativeSelection(
+        this,
+        this.prosemirrorView.state,
+      );
+    }, ySyncPluginKey);
   }
 
-  destroy () {
-    this.isDestroyed = true;
+  /**
+   * View is ready to listen to changes. Register observers.
+   * @param {any} prosemirrorView
+   */
+  initView(prosemirrorView) {
+    if (this.prosemirrorView != null) this.destroy();
+    this.prosemirrorView = prosemirrorView;
+    this.doc.on("beforeAllTransactions", this.beforeAllTransactions);
+    this.doc.on("afterAllTransactions", this.afterAllTransactions);
+    this.type.observeDeep(this._observeFunction);
+  }
+
+  destroy() {
+    if (this.prosemirrorView == null) return;
+    this.prosemirrorView = null;
     this.type.unobserveDeep(this._observeFunction);
-    this.doc.off('beforeAllTransactions', this.beforeAllTransactions);
-    this.doc.off('afterAllTransactions', this.afterAllTransactions);
+    this.doc.off("beforeAllTransactions", this.beforeAllTransactions);
+    this.doc.off("afterAllTransactions", this.afterAllTransactions);
   }
 }
 
@@ -470,16 +695,30 @@ class ProsemirrorBinding {
  * @param {function('removed' | 'added', Y.ID):any} [computeYChange]
  * @return {PModel.Node | null}
  */
-const createNodeIfNotExists = (el, schema, mapping, snapshot, prevSnapshot, computeYChange) => {
+const createNodeIfNotExists = (
+  el,
+  schema,
+  mapping,
+  snapshot,
+  prevSnapshot,
+  computeYChange,
+) => {
   const node = /** @type {PModel.Node} */ (mapping.get(el));
   if (node === undefined) {
     if (el instanceof Y__namespace.XmlElement) {
-      return createNodeFromYElement(el, schema, mapping, snapshot, prevSnapshot, computeYChange)
+      return createNodeFromYElement(
+        el,
+        schema,
+        mapping,
+        snapshot,
+        prevSnapshot,
+        computeYChange,
+      );
     } else {
-      throw error__namespace.methodUnimplemented() // we are currently not handling hooks
+      throw error__namespace.methodUnimplemented(); // we are currently not handling hooks
     }
   }
-  return node
+  return node;
 };
 
 /**
@@ -492,18 +731,54 @@ const createNodeIfNotExists = (el, schema, mapping, snapshot, prevSnapshot, comp
  * @param {function('removed' | 'added', Y.ID):any} [computeYChange]
  * @return {PModel.Node | null} Returns node if node could be created. Otherwise it deletes the yjs type and returns null
  */
-const createNodeFromYElement = (el, schema, mapping, snapshot, prevSnapshot, computeYChange) => {
+const createNodeFromYElement = (
+  el,
+  schema,
+  mapping,
+  snapshot,
+  prevSnapshot,
+  computeYChange,
+) => {
   const children = [];
-  const createChildren = type => {
+  const createChildren = (type) => {
     if (type.constructor === Y__namespace.XmlElement) {
-      const n = createNodeIfNotExists(type, schema, mapping, snapshot, prevSnapshot, computeYChange);
+      const n = createNodeIfNotExists(
+        type,
+        schema,
+        mapping,
+        snapshot,
+        prevSnapshot,
+        computeYChange,
+      );
       if (n !== null) {
         children.push(n);
       }
     } else {
-      const ns = createTextNodesFromYText(type, schema, mapping, snapshot, prevSnapshot, computeYChange);
+      // If the next ytext exists and was created by us, move the content to the current ytext.
+      // This is a fix for #160 -- duplication of characters when two Y.Text exist next to each
+      // other.
+      const nextytext = type._item.right?.content.type;
+      if (
+        nextytext != null &&
+        !nextytext._item.deleted &&
+        nextytext._item.id.client === nextytext.doc.clientID
+      ) {
+        type.applyDelta([{ retain: type.length }, ...nextytext.toDelta()]);
+        nextytext.doc.transact((tr) => {
+          nextytext._item.delete(tr);
+        });
+      }
+      // now create the prosemirror text nodes
+      const ns = createTextNodesFromYText(
+        type,
+        schema,
+        mapping,
+        snapshot,
+        prevSnapshot,
+        computeYChange,
+      );
       if (ns !== null) {
-        ns.forEach(textchild => {
+        ns.forEach((textchild) => {
           if (textchild !== null) {
             children.push(textchild);
           }
@@ -514,27 +789,34 @@ const createNodeFromYElement = (el, schema, mapping, snapshot, prevSnapshot, com
   if (snapshot === undefined || prevSnapshot === undefined) {
     el.toArray().forEach(createChildren);
   } else {
-    Y__namespace.typeListToArraySnapshot(el, new Y__namespace.Snapshot(prevSnapshot.ds, snapshot.sv)).forEach(createChildren);
+    Y__namespace.typeListToArraySnapshot(
+      el,
+      new Y__namespace.Snapshot(prevSnapshot.ds, snapshot.sv),
+    ).forEach(createChildren);
   }
   try {
     const attrs = el.getAttributes(snapshot);
     if (snapshot !== undefined) {
       if (!isVisible(/** @type {Y.Item} */ (el._item), snapshot)) {
-        attrs.ychange = computeYChange ? computeYChange('removed', /** @type {Y.Item} */ (el._item).id) : { type: 'removed' };
+        attrs.ychange = computeYChange
+          ? computeYChange("removed", /** @type {Y.Item} */ (el._item).id)
+          : { type: "removed" };
       } else if (!isVisible(/** @type {Y.Item} */ (el._item), prevSnapshot)) {
-        attrs.ychange = computeYChange ? computeYChange('added', /** @type {Y.Item} */ (el._item).id) : { type: 'added' };
+        attrs.ychange = computeYChange
+          ? computeYChange("added", /** @type {Y.Item} */ (el._item).id)
+          : { type: "added" };
       }
     }
     const node = schema.node(el.nodeName, attrs, children);
     mapping.set(el, node);
-    return node
+    return node;
   } catch (e) {
     // an error occured while creating the node. This is probably a result of a concurrent action.
-    /** @type {Y.Doc} */ (el.doc).transact(transaction => {
+    /** @type {Y.Doc} */ (el.doc).transact((transaction) => {
       /** @type {Y.Item} */ (el._item).delete(transaction);
     }, ySyncPluginKey);
     mapping.delete(el);
-    return null
+    return null;
   }
 };
 
@@ -542,13 +824,20 @@ const createNodeFromYElement = (el, schema, mapping, snapshot, prevSnapshot, com
  * @private
  * @param {Y.XmlText} text
  * @param {any} schema
- * @param {ProsemirrorMapping} mapping
+ * @param {ProsemirrorMapping} _mapping
  * @param {Y.Snapshot} [snapshot]
  * @param {Y.Snapshot} [prevSnapshot]
  * @param {function('removed' | 'added', Y.ID):any} [computeYChange]
  * @return {Array<PModel.Node>|null}
  */
-const createTextNodesFromYText = (text, schema, mapping, snapshot, prevSnapshot, computeYChange) => {
+const createTextNodesFromYText = (
+  text,
+  schema,
+  _mapping,
+  snapshot,
+  prevSnapshot,
+  computeYChange,
+) => {
   const nodes = [];
   const deltas = text.toDelta(snapshot, prevSnapshot, computeYChange);
   try {
@@ -558,7 +847,7 @@ const createTextNodesFromYText = (text, schema, mapping, snapshot, prevSnapshot,
       for (const markName in delta.attributes) {
         if (Array.isArray(delta.attributes[markName])) {
           // multiple marks of same type
-          delta.attributes[markName].forEach(attrs => {
+          delta.attributes[markName].forEach((attrs) => {
             marks.push(schema.mark(markName, attrs));
           });
         } else {
@@ -570,13 +859,13 @@ const createTextNodesFromYText = (text, schema, mapping, snapshot, prevSnapshot,
     }
   } catch (e) {
     // an error occured while creating the node. This is probably a result of a concurrent action.
-    /** @type {Y.Doc} */ (text.doc).transact(transaction => {
+    /** @type {Y.Doc} */ (text.doc).transact((transaction) => {
       /** @type {Y.Item} */ (text._item).delete(transaction);
     }, ySyncPluginKey);
-    return null
+    return null;
   }
   // @ts-ignore
-  return nodes
+  return nodes;
 };
 
 /**
@@ -587,14 +876,14 @@ const createTextNodesFromYText = (text, schema, mapping, snapshot, prevSnapshot,
  */
 const createTypeFromTextNodes = (nodes, mapping) => {
   const type = new Y__namespace.XmlText();
-  const delta = nodes.map(node => ({
+  const delta = nodes.map((node) => ({
     // @ts-ignore
     insert: node.text,
-    attributes: marksToAttributes(node.marks)
+    attributes: marksToAttributes(node.marks),
   }));
   type.applyDelta(delta);
   mapping.set(type, nodes);
-  return type
+  return type;
 };
 
 /**
@@ -607,13 +896,18 @@ const createTypeFromElementNode = (node, mapping) => {
   const type = new Y__namespace.XmlElement(node.type.name);
   for (const key in node.attrs) {
     const val = node.attrs[key];
-    if (val !== null && key !== 'ychange') {
+    if (val !== null && key !== "ychange") {
       type.setAttribute(key, val);
     }
   }
-  type.insert(0, normalizePNodeContent(node).map(n => createTypeFromTextOrElementNode(n, mapping)));
+  type.insert(
+    0,
+    normalizePNodeContent(node).map((n) =>
+      createTypeFromTextOrElementNode(n, mapping),
+    ),
+  );
   mapping.set(type, node);
-  return type
+  return type;
 };
 
 /**
@@ -622,27 +916,35 @@ const createTypeFromElementNode = (node, mapping) => {
  * @param {ProsemirrorMapping} mapping
  * @return {Y.XmlElement|Y.XmlText}
  */
-const createTypeFromTextOrElementNode = (node, mapping) => node instanceof Array ? createTypeFromTextNodes(node, mapping) : createTypeFromElementNode(node, mapping);
+const createTypeFromTextOrElementNode = (node, mapping) =>
+  node instanceof Array
+    ? createTypeFromTextNodes(node, mapping)
+    : createTypeFromElementNode(node, mapping);
 
-const isObject = (val) => typeof val === 'object' && val !== null;
+const isObject = (val) => typeof val === "object" && val !== null;
 
 const equalAttrs = (pattrs, yattrs) => {
-  const keys = Object.keys(pattrs).filter(key => pattrs[key] !== null);
-  let eq = keys.length === Object.keys(yattrs).filter(key => yattrs[key] !== null).length;
+  const keys = Object.keys(pattrs).filter((key) => pattrs[key] !== null);
+  let eq =
+    keys.length ===
+    Object.keys(yattrs).filter((key) => yattrs[key] !== null).length;
   for (let i = 0; i < keys.length && eq; i++) {
     const key = keys[i];
     const l = pattrs[key];
     const r = yattrs[key];
-    eq = key === 'ychange' || l === r || (isObject(l) && isObject(r) && equalAttrs(l, r));
+    eq =
+      key === "ychange" ||
+      l === r ||
+      (isObject(l) && isObject(r) && equalAttrs(l, r));
   }
-  return eq
+  return eq;
 };
 
 const containsEqualMark = (pattrs, yattrs) => {
   if (Array.isArray(yattrs)) {
-    return !!yattrs.find(el => equalAttrs(pattrs, el))
+    return !!yattrs.find((el) => equalAttrs(pattrs, el));
   } else {
-    return equalAttrs(pattrs, yattrs)
+    return equalAttrs(pattrs, yattrs);
   }
 };
 
@@ -654,7 +956,7 @@ const containsEqualMark = (pattrs, yattrs) => {
  * @param {any} pnode
  * @return {NormalizedPNodeContent}
  */
-const normalizePNodeContent = pnode => {
+const normalizePNodeContent = (pnode) => {
   const c = pnode.content.content;
   const res = [];
   for (let i = 0; i < c.length; i++) {
@@ -670,7 +972,7 @@ const normalizePNodeContent = pnode => {
       res.push(n);
     }
   }
-  return res
+  return res;
 };
 
 const countYTextMarks = (yattrs) => {
@@ -682,7 +984,7 @@ const countYTextMarks = (yattrs) => {
       count++;
     }
   });
-  return count
+  return count;
 };
 
 /**
@@ -691,7 +993,17 @@ const countYTextMarks = (yattrs) => {
  */
 const equalYTextPText = (ytext, ptexts) => {
   const delta = ytext.toDelta();
-  return delta.length === ptexts.length && delta.every((d, i) => d.insert === /** @type {any} */ (ptexts[i]).text && countYTextMarks(d.attributes || {}) === ptexts[i].marks.length && ptexts[i].marks.every(mark => containsEqualMark(d.attributes[mark.type.name] || {}, mark.attrs)))
+  return (
+    delta.length === ptexts.length &&
+    delta.every(
+      (d, i) =>
+        d.insert === /** @type {any} */ (ptexts[i]).text &&
+        countYTextMarks(d.attributes || {}) === ptexts[i].marks.length &&
+        ptexts[i].marks.every((mark) =>
+          containsEqualMark(d.attributes[mark.type.name] || {}, mark.attrs),
+        ),
+    )
+  );
 };
 
 /**
@@ -699,18 +1011,37 @@ const equalYTextPText = (ytext, ptexts) => {
  * @param {any|Array<any>} pnode
  */
 const equalYTypePNode = (ytype, pnode) => {
-  if (ytype instanceof Y__namespace.XmlElement && !(pnode instanceof Array) && matchNodeName(ytype, pnode)) {
+  if (
+    ytype instanceof Y__namespace.XmlElement &&
+    !(pnode instanceof Array) &&
+    matchNodeName(ytype, pnode)
+  ) {
     const normalizedContent = normalizePNodeContent(pnode);
-    return ytype._length === normalizedContent.length && equalAttrs(ytype.getAttributes(), pnode.attrs) && ytype.toArray().every((ychild, i) => equalYTypePNode(ychild, normalizedContent[i]))
+    return (
+      ytype._length === normalizedContent.length &&
+      equalAttrs(ytype.getAttributes(), pnode.attrs) &&
+      ytype
+        .toArray()
+        .every((ychild, i) => equalYTypePNode(ychild, normalizedContent[i]))
+    );
   }
-  return ytype instanceof Y__namespace.XmlText && pnode instanceof Array && equalYTextPText(ytype, pnode)
+  return (
+    ytype instanceof Y__namespace.XmlText &&
+    pnode instanceof Array &&
+    equalYTextPText(ytype, pnode)
+  );
 };
 
 /**
  * @param {PModel.Node | Array<PModel.Node> | undefined} mapped
  * @param {PModel.Node | Array<PModel.Node>} pcontent
  */
-const mappedIdentity = (mapped, pcontent) => mapped === pcontent || (mapped instanceof Array && pcontent instanceof Array && mapped.length === pcontent.length && mapped.every((a, i) => pcontent[i] === a));
+const mappedIdentity = (mapped, pcontent) =>
+  mapped === pcontent ||
+  (mapped instanceof Array &&
+    pcontent instanceof Array &&
+    mapped.length === pcontent.length &&
+    mapped.every((a, i) => pcontent[i] === a));
 
 /**
  * @param {Y.XmlElement} ytype
@@ -731,9 +1062,9 @@ const computeChildEqualityFactor = (ytype, pnode, mapping) => {
     const leftY = yChildren[left];
     const leftP = pChildren[left];
     if (mappedIdentity(mapping.get(leftY), leftP)) {
-      foundMappedChild = true;// definite (good) match!
+      foundMappedChild = true; // definite (good) match!
     } else if (!equalYTypePNode(leftY, leftP)) {
-      break
+      break;
     }
   }
   for (; left + right < minCnt; right++) {
@@ -742,17 +1073,17 @@ const computeChildEqualityFactor = (ytype, pnode, mapping) => {
     if (mappedIdentity(mapping.get(rightY), rightP)) {
       foundMappedChild = true;
     } else if (!equalYTypePNode(rightY, rightP)) {
-      break
+      break;
     }
   }
   return {
     equalityFactor: left + right,
-    foundMappedChild
-  }
+    foundMappedChild,
+  };
 };
 
-const ytextTrans = ytext => {
-  let str = '';
+const ytextTrans = (ytext) => {
+  let str = "";
   /**
    * @type {Y.Item|null}
    */
@@ -770,8 +1101,8 @@ const ytextTrans = ytext => {
   }
   return {
     str,
-    nAttrs
-  }
+    nAttrs,
+  };
 };
 
 /**
@@ -784,17 +1115,25 @@ const ytextTrans = ytext => {
 const updateYText = (ytext, ptexts, mapping) => {
   mapping.set(ytext, ptexts);
   const { nAttrs, str } = ytextTrans(ytext);
-  const content = ptexts.map(p => ({ insert: /** @type {any} */ (p).text, attributes: Object.assign({}, nAttrs, marksToAttributes(p.marks)) }));
-  const { insert, remove, index } = diff.simpleDiff(str, content.map(c => c.insert).join(''));
+  const content = ptexts.map((p) => ({
+    insert: /** @type {any} */ (p).text,
+    attributes: Object.assign({}, nAttrs, marksToAttributes(p.marks)),
+  }));
+  const { insert, remove, index } = diff.simpleDiff(
+    str,
+    content.map((c) => c.insert).join(""),
+  );
   ytext.delete(index, remove);
   ytext.insert(index, insert);
-  ytext.applyDelta(content.map(c => ({ retain: c.insert.length, attributes: c.attributes })));
+  ytext.applyDelta(
+    content.map((c) => ({ retain: c.insert.length, attributes: c.attributes })),
+  );
 };
 
-const marksToAttributes = marks => {
+const marksToAttributes = (marks) => {
   const pattrs = {};
-  marks.forEach(mark => {
-    if (mark.type.name !== 'ychange') {
+  marks.forEach((mark) => {
+    if (mark.type.name !== "ychange") {
       if (pattrs[mark.type.name] && Array.isArray(pattrs[mark.type.name])) {
         // already has multiple marks of same type
         pattrs[mark.type.name].push(mark.attrs);
@@ -807,19 +1146,28 @@ const marksToAttributes = marks => {
       }
     }
   });
-  return pattrs
+  return pattrs;
 };
 
 /**
+ * Update a yDom node by syncing the current content of the prosemirror node.
+ *
+ * This is a y-prosemirror internal feature that you can use at your own risk.
+ *
  * @private
+ * @unstable
+ *
  * @param {{transact: Function}} y
  * @param {Y.XmlFragment} yDomFragment
  * @param {any} pNode
  * @param {ProsemirrorMapping} mapping
  */
 const updateYFragment = (y, yDomFragment, pNode, mapping) => {
-  if (yDomFragment instanceof Y__namespace.XmlElement && yDomFragment.nodeName !== pNode.type.name) {
-    throw new Error('node name mismatch!')
+  if (
+    yDomFragment instanceof Y__namespace.XmlElement &&
+    yDomFragment.nodeName !== pNode.type.name
+  ) {
+    throw new Error("node name mismatch!");
   }
   mapping.set(yDomFragment, pNode);
   // update attributes
@@ -828,7 +1176,7 @@ const updateYFragment = (y, yDomFragment, pNode, mapping) => {
     const pAttrs = pNode.attrs;
     for (const key in pAttrs) {
       if (pAttrs[key] !== null) {
-        if (yDomAttrs[key] !== pAttrs[key] && key !== 'ychange') {
+        if (yDomAttrs[key] !== pAttrs[key] && key !== "ychange") {
           yDomFragment.setAttribute(key, pAttrs[key]);
         }
       } else {
@@ -851,7 +1199,7 @@ const updateYFragment = (y, yDomFragment, pNode, mapping) => {
   let left = 0;
   let right = 0;
   // find number of matching elements from left
-  for (;left < minCnt; left++) {
+  for (; left < minCnt; left++) {
     const leftY = yChildren[left];
     const leftP = pChildren[left];
     if (!mappedIdentity(mapping.get(leftY), leftP)) {
@@ -859,12 +1207,12 @@ const updateYFragment = (y, yDomFragment, pNode, mapping) => {
         // update mapping
         mapping.set(leftY, leftP);
       } else {
-        break
+        break;
       }
     }
   }
   // find number of matching elements from right
-  for (;right + left + 1 < minCnt; right++) {
+  for (; right + left + 1 < minCnt; right++) {
     const rightY = yChildren[yChildCnt - right - 1];
     const rightP = pChildren[pChildCnt - right - 1];
     if (!mappedIdentity(mapping.get(rightY), rightP)) {
@@ -872,7 +1220,7 @@ const updateYFragment = (y, yDomFragment, pNode, mapping) => {
         // update mapping
         mapping.set(rightY, rightP);
       } else {
-        break
+        break;
       }
     }
   }
@@ -889,41 +1237,80 @@ const updateYFragment = (y, yDomFragment, pNode, mapping) => {
         }
         left += 1;
       } else {
-        let updateLeft = leftY instanceof Y__namespace.XmlElement && matchNodeName(leftY, leftP);
-        let updateRight = rightY instanceof Y__namespace.XmlElement && matchNodeName(rightY, rightP);
+        let updateLeft =
+          leftY instanceof Y__namespace.XmlElement && matchNodeName(leftY, leftP);
+        let updateRight =
+          rightY instanceof Y__namespace.XmlElement && matchNodeName(rightY, rightP);
         if (updateLeft && updateRight) {
           // decide which which element to update
-          const equalityLeft = computeChildEqualityFactor(/** @type {Y.XmlElement} */ (leftY), /** @type {PModel.Node} */ (leftP), mapping);
-          const equalityRight = computeChildEqualityFactor(/** @type {Y.XmlElement} */ (rightY), /** @type {PModel.Node} */ (rightP), mapping);
-          if (equalityLeft.foundMappedChild && !equalityRight.foundMappedChild) {
+          const equalityLeft = computeChildEqualityFactor(
+            /** @type {Y.XmlElement} */ (leftY),
+            /** @type {PModel.Node} */ (leftP),
+            mapping,
+          );
+          const equalityRight = computeChildEqualityFactor(
+            /** @type {Y.XmlElement} */ (rightY),
+            /** @type {PModel.Node} */ (rightP),
+            mapping,
+          );
+          if (
+            equalityLeft.foundMappedChild &&
+            !equalityRight.foundMappedChild
+          ) {
             updateRight = false;
-          } else if (!equalityLeft.foundMappedChild && equalityRight.foundMappedChild) {
+          } else if (
+            !equalityLeft.foundMappedChild &&
+            equalityRight.foundMappedChild
+          ) {
             updateLeft = false;
-          } else if (equalityLeft.equalityFactor < equalityRight.equalityFactor) {
+          } else if (
+            equalityLeft.equalityFactor < equalityRight.equalityFactor
+          ) {
             updateLeft = false;
           } else {
             updateRight = false;
           }
         }
         if (updateLeft) {
-          updateYFragment(y, /** @type {Y.XmlFragment} */ (leftY), /** @type {PModel.Node} */ (leftP), mapping);
+          updateYFragment(
+            y,
+            /** @type {Y.XmlFragment} */ (leftY),
+            /** @type {PModel.Node} */ (leftP),
+            mapping,
+          );
           left += 1;
         } else if (updateRight) {
-          updateYFragment(y, /** @type {Y.XmlFragment} */ (rightY), /** @type {PModel.Node} */ (rightP), mapping);
+          updateYFragment(
+            y,
+            /** @type {Y.XmlFragment} */ (rightY),
+            /** @type {PModel.Node} */ (rightP),
+            mapping,
+          );
           right += 1;
         } else {
+          mapping.delete(yDomFragment.get(left));
           yDomFragment.delete(left, 1);
-          yDomFragment.insert(left, [createTypeFromTextOrElementNode(leftP, mapping)]);
+          yDomFragment.insert(left, [
+            createTypeFromTextOrElementNode(leftP, mapping),
+          ]);
           left += 1;
         }
       }
     }
     const yDelLen = yChildCnt - left - right;
-    if (yChildCnt === 1 && pChildCnt === 0 && yChildren[0] instanceof Y__namespace.XmlText) {
+    if (
+      yChildCnt === 1 &&
+      pChildCnt === 0 &&
+      yChildren[0] instanceof Y__namespace.XmlText
+    ) {
+      mapping.delete(yChildren[0]);
       // Edge case handling https://github.com/yjs/y-prosemirror/issues/108
       // Only delete the content of the Y.Text to retain remote changes on the same Y.Text object
       yChildren[0].delete(0, yChildren[0].length);
     } else if (yDelLen > 0) {
+      yDomFragment
+        .slice(left, left + yDelLen)
+        .forEach((type) => mapping.delete(type));
       yDomFragment.delete(left, yDelLen);
     }
     if (left + right < pChildCnt) {
@@ -941,7 +1328,8 @@ const updateYFragment = (y, yDomFragment, pNode, mapping) => {
  * @param {Y.XmlElement} yElement
  * @param {any} pNode Prosemirror Node
  */
-const matchNodeName = (yElement, pNode) => !(pNode instanceof Array) && yElement.nodeName === pNode.type.name;
+const matchNodeName = (yElement, pNode) =>
+  !(pNode instanceof Array) && yElement.nodeName === pNode.type.name;
 
 /**
  * Either a node if type is YXmlElement or an Array of text nodes if YXmlText
@@ -989,7 +1377,7 @@ const setMeta = (view, key, value) => {
  */
 const absolutePositionToRelativePosition = (pos, type, mapping) => {
   if (pos === 0) {
-    return Y__namespace.createRelativePositionFromTypeIndex(type, 0)
+    return Y__namespace.createRelativePositionFromTypeIndex(type, 0, -1)
   }
   /**
    * @type {any}
@@ -998,7 +1386,7 @@ const absolutePositionToRelativePosition = (pos, type, mapping) => {
   while (n !== null && type !== n) {
     if (n instanceof Y__namespace.XmlText) {
       if (n._length >= pos) {
-        return Y__namespace.createRelativePositionFromTypeIndex(n, pos)
+        return Y__namespace.createRelativePositionFromTypeIndex(n, pos, -1)
       } else {
         pos -= n._length;
       }
@@ -1052,7 +1440,7 @@ const absolutePositionToRelativePosition = (pos, type, mapping) => {
       return createRelativePosition(n._item.parent, n._item)
     }
   }
-  return Y__namespace.createRelativePositionFromTypeIndex(type, type._length)
+  return Y__namespace.createRelativePositionFromTypeIndex(type, type._length, -1)
 };
 
 const createRelativePosition = (type, item) => {
@@ -1125,6 +1513,55 @@ const relativePositionToAbsolutePosition = (y, documentType, relPos, mapping) =>
     type = /** @type {Y.AbstractType} */ (parent);
   }
   return pos - 1 // we don't count the most outer tag, because it is a fragment
+};
+
+/**
+ * Utility function for converting an Y.Fragment to a ProseMirror fragment.
+ *
+ * @param {Y.XmlFragment} yXmlFragment
+ * @param {Schema} schema
+ */
+const yXmlFragmentToProseMirrorFragment = (yXmlFragment, schema) => {
+  const fragmentContent = yXmlFragment.toArray().map((t) =>
+    createNodeFromYElement(
+      /** @type {Y.XmlElement} */ (t),
+      schema,
+      new Map()
+    )
+  ).filter((n) => n !== null);
+  return PModel.Fragment.fromArray(fragmentContent)
+};
+
+/**
+ * Utility function for converting an Y.Fragment to a ProseMirror node.
+ *
+ * @param {Y.XmlFragment} yXmlFragment
+ * @param {Schema} schema
+ */
+const yXmlFragmentToProseMirrorRootNode = (yXmlFragment, schema) =>
+  schema.topNodeType.create(null, yXmlFragmentToProseMirrorFragment(yXmlFragment, schema));
+
+/**
+ * The initial ProseMirror content should be supplied by Yjs. This function transforms a Y.Fragment
+ * to a ProseMirror Doc node and creates a mapping that is used by the sync plugin.
+ *
+ * @param {Y.XmlFragment} yXmlFragment
+ * @param {Schema} schema
+ */
+const initProseMirrorDoc = (yXmlFragment, schema) => {
+  /**
+   * @type {ProsemirrorMapping}
+   */
+  const mapping = new Map();
+  const fragmentContent = yXmlFragment.toArray().map((t) =>
+    createNodeFromYElement(
+      /** @type {Y.XmlElement} */ (t),
+      schema,
+      mapping
+    )
+  ).filter((n) => n !== null);
+  const doc = schema.topNodeType.create(null, PModel.Fragment.fromArray(fragmentContent));
+  return { doc, mapping }
 };
 
 /**
@@ -1207,6 +1644,8 @@ function prosemirrorJSONToYXmlFragment (schema, state, xmlFragment) {
 }
 
 /**
+ * @deprecated Use `yXmlFragmentToProseMirrorRootNode` instead
+ *
  * Utility method to convert a Y.Doc to a Prosemirror Doc node.
  *
  * @param {Schema} schema
@@ -1219,6 +1658,9 @@ function yDocToProsemirror (schema, ydoc) {
 }
 
 /**
+ *
+ * @deprecated Use `yXmlFragmentToProseMirrorRootNode` instead
+ *
  * Utility method to convert a Y.XmlFragment to a Prosemirror Doc node.
  *
  * @param {Schema} schema
@@ -1231,6 +1673,9 @@ function yXmlFragmentToProsemirror (schema, xmlFragment) {
 }
 
 /**
+ *
+ * @deprecated Use `yXmlFragmentToProseMirrorRootNode` instead
+ *
  * Utility method to convert a Y.Doc to Prosemirror compatible JSON.
  *
  * @param {Y.Doc} ydoc
@@ -1245,6 +1690,8 @@ function yDocToProsemirrorJSON (
 }
 
 /**
+ * @deprecated Use `yXmlFragmentToProseMirrorRootNode` instead
+ *
  * Utility method to convert a Y.Doc to Prosemirror compatible JSON.
  *
  * @param {Y.XmlFragment} xmlFragment The fragment, which must be part of a Y.Doc.
@@ -1330,24 +1777,38 @@ function yXmlFragmentToProsemirrorJSON (xmlFragment) {
 }
 
 /**
+ * Default awareness state filter
+ *
+ * @param {number} currentClientId current client id
+ * @param {number} userClientId user client id
+ * @param {any} _user user data
+ * @return {boolean}
+ */
+const defaultAwarenessStateFilter = (
+  currentClientId,
+  userClientId,
+  _user,
+) => currentClientId !== userClientId;
+
+/**
  * Default generator for a cursor element
  *
  * @param {any} user user data
  * @return {HTMLElement}
  */
-const defaultCursorBuilder = user => {
-  const cursor = document.createElement('span');
-  cursor.classList.add('ProseMirror-yjs-cursor');
-  cursor.setAttribute('style', `border-color: ${user.color}`);
-  const userDiv = document.createElement('div');
-  userDiv.setAttribute('style', `background-color: ${user.color}`);
+const defaultCursorBuilder = (user) => {
+  const cursor = document.createElement("span");
+  cursor.classList.add("ProseMirror-yjs-cursor");
+  cursor.setAttribute("style", `border-color: ${user.color}`);
+  const userDiv = document.createElement("div");
+  userDiv.setAttribute("style", `background-color: ${user.color}`);
   userDiv.insertBefore(document.createTextNode(user.name), null);
-  const nonbreakingSpace1 = document.createTextNode('\u2060');
-  const nonbreakingSpace2 = document.createTextNode('\u2060');
+  const nonbreakingSpace1 = document.createTextNode("\u2060");
+  const nonbreakingSpace2 = document.createTextNode("\u2060");
   cursor.insertBefore(nonbreakingSpace1, null);
   cursor.insertBefore(userDiv, null);
   cursor.insertBefore(nonbreakingSpace2, null);
-  return cursor
+  return cursor;
 };
 
 /**
@@ -1356,11 +1817,11 @@ const defaultCursorBuilder = user => {
  * @param {any} user user data
  * @return {import('prosemirror-view').DecorationAttrs}
  */
-const defaultSelectionBuilder = user => {
+const defaultSelectionBuilder = (user) => {
   return {
     style: `background-color: ${user.color}70`,
-    class: `ProseMirror-yjs-selection`
-  }
+    class: `ProseMirror-yjs-selection`,
+  };
 };
 
 const rxValidColor = /^#[0-9a-fA-F]{6}$/;
@@ -1368,45 +1829,79 @@ const rxValidColor = /^#[0-9a-fA-F]{6}$/;
 /**
  * @param {any} state
  * @param {Awareness} awareness
+ * @param {function(number, number, any):boolean} awarenessFilter
+ * @param {function({ name: string, color: string }):Element} createCursor
+ * @param {function({ name: string, color: string }):import('prosemirror-view').DecorationAttrs} createSelection
  * @return {any} DecorationSet
  */
-const createDecorations = (state, awareness, createCursor, createSelection) => {
+const createDecorations = (
+  state,
+  awareness,
+  awarenessFilter,
+  createCursor,
+  createSelection,
+) => {
   const ystate = ySyncPluginKey.getState(state);
   const y = ystate.doc;
   const decorations = [];
-  if (ystate.snapshot != null || ystate.prevSnapshot != null || ystate.binding === null) {
+  if (
+    ystate.snapshot != null ||
+    ystate.prevSnapshot != null ||
+    ystate.binding.mapping.size === 0
+  ) {
     // do not render cursors while snapshot is active
-    return prosemirrorView.DecorationSet.create(state.doc, [])
+    return prosemirrorView.DecorationSet.create(state.doc, []);
   }
   awareness.getStates().forEach((aw, clientId) => {
-    if (clientId === y.clientID) {
-      return
+    if (!awarenessFilter(y.clientID, clientId, aw)) {
+      return;
     }
+
     if (aw.cursor != null) {
       const user = aw.user || {};
       if (user.color == null) {
-        user.color = '#ffa500';
+        user.color = "#ffa500";
       } else if (!rxValidColor.test(user.color)) {
         // We only support 6-digit RGB colors in y-prosemirror
-        console.warn('A user uses an unsupported color format', user);
+        console.warn("A user uses an unsupported color format", user);
       }
       if (user.name == null) {
         user.name = `User: ${clientId}`;
       }
-      let anchor = relativePositionToAbsolutePosition(y, ystate.type, Y__namespace.createRelativePositionFromJSON(aw.cursor.anchor), ystate.binding.mapping);
-      let head = relativePositionToAbsolutePosition(y, ystate.type, Y__namespace.createRelativePositionFromJSON(aw.cursor.head), ystate.binding.mapping);
+      let anchor = relativePositionToAbsolutePosition(
+        y,
+        ystate.type,
+        Y__namespace.createRelativePositionFromJSON(aw.cursor.anchor),
+        ystate.binding.mapping,
+      );
+      let head = relativePositionToAbsolutePosition(
+        y,
+        ystate.type,
+        Y__namespace.createRelativePositionFromJSON(aw.cursor.head),
+        ystate.binding.mapping,
+      );
       if (anchor !== null && head !== null) {
         const maxsize = math__namespace.max(state.doc.content.size - 1, 0);
         anchor = math__namespace.min(anchor, maxsize);
         head = math__namespace.min(head, maxsize);
-        decorations.push(prosemirrorView.Decoration.widget(head, () => createCursor(user), { key: clientId + '', side: 10 }));
+        decorations.push(
+          prosemirrorView.Decoration.widget(head, () => createCursor(user), {
+            key: clientId + "",
+            side: 10,
+          }),
+        );
         const from = math__namespace.min(anchor, head);
         const to = math__namespace.max(anchor, head);
-        decorations.push(prosemirrorView.Decoration.inline(from, to, createSelection(user), { inclusiveEnd: true, inclusiveStart: false }));
+        decorations.push(
+          prosemirrorView.Decoration.inline(from, to, createSelection(user), {
+            inclusiveEnd: true,
+            inclusiveStart: false,
+          }),
+        );
       }
     }
   });
-  return prosemirrorView.DecorationSet.create(state.doc, decorations)
+  return prosemirrorView.DecorationSet.create(state.doc, decorations);
 };
 
 /**
@@ -1415,81 +1910,131 @@ const createDecorations = (state, awareness, createCursor, createSelection) => {
  *
  * @public
  * @param {Awareness} awareness
- * @param {object} [opts]
+ * @param {object} opts
+ * @param {function(any, any, any):boolean} [opts.awarenessStateFilter]
  * @param {function(any):HTMLElement} [opts.cursorBuilder]
  * @param {function(any):import('prosemirror-view').DecorationAttrs} [opts.selectionBuilder]
  * @param {function(any):any} [opts.getSelection]
  * @param {string} [cursorStateField] By default all editor bindings use the awareness 'cursor' field to propagate cursor information.
  * @return {any}
  */
-const yCursorPlugin = (awareness, { cursorBuilder = defaultCursorBuilder, selectionBuilder = defaultSelectionBuilder, getSelection = state => state.selection } = {}, cursorStateField = 'cursor') => new prosemirrorState.Plugin({
-  key: yCursorPluginKey,
-  state: {
-    init (_, state) {
-      return createDecorations(state, awareness, cursorBuilder, selectionBuilder)
-    },
-    apply (tr, prevState, oldState, newState) {
-      const ystate = ySyncPluginKey.getState(newState);
-      const yCursorState = tr.getMeta(yCursorPluginKey);
-      if ((ystate && ystate.isChangeOrigin) || (yCursorState && yCursorState.awarenessUpdated)) {
-        return createDecorations(newState, awareness, cursorBuilder, selectionBuilder)
-      }
-      return prevState.map(tr.mapping, tr.doc)
-    }
-  },
-  props: {
-    decorations: state => {
-      return yCursorPluginKey.getState(state)
-    }
-  },
-  view: view => {
-    const awarenessListener = () => {
-      // @ts-ignore
-      if (view.docView) {
-        setMeta(view, yCursorPluginKey, { awarenessUpdated: true });
-      }
-    };
-    const updateCursorInfo = () => {
-      const ystate = ySyncPluginKey.getState(view.state);
-      // @note We make implicit checks when checking for the cursor property
-      const current = awareness.getLocalState() || {};
-      if (ystate.binding == null) {
-        return
-      }
-      if (view.hasFocus()) {
-        const selection = getSelection(view.state);
-        /**
-         * @type {Y.RelativePosition}
-         */
-        const anchor = absolutePositionToRelativePosition(selection.anchor, ystate.type, ystate.binding.mapping);
-        /**
-         * @type {Y.RelativePosition}
-         */
-        const head = absolutePositionToRelativePosition(selection.head, ystate.type, ystate.binding.mapping);
-        if (current.cursor == null || !Y__namespace.compareRelativePositions(Y__namespace.createRelativePositionFromJSON(current.cursor.anchor), anchor) || !Y__namespace.compareRelativePositions(Y__namespace.createRelativePositionFromJSON(current.cursor.head), head)) {
-          awareness.setLocalStateField(cursorStateField, {
-            anchor, head
-          });
+const yCursorPlugin = (
+  awareness,
+  {
+    awarenessStateFilter = defaultAwarenessStateFilter,
+    cursorBuilder = defaultCursorBuilder,
+    selectionBuilder = defaultSelectionBuilder,
+    getSelection = (state) => state.selection,
+  } = {},
+  cursorStateField = "cursor",
+) =>
+  new prosemirrorState.Plugin({
+    key: yCursorPluginKey,
+    state: {
+      init(_, state) {
+        return createDecorations(
+          state,
+          awareness,
+          awarenessStateFilter,
+          cursorBuilder,
+          selectionBuilder,
+        );
+      },
+      apply(tr, prevState, _oldState, newState) {
+        const ystate = ySyncPluginKey.getState(newState);
+        const yCursorState = tr.getMeta(yCursorPluginKey);
+        if (
+          (ystate && ystate.isChangeOrigin) ||
+          (yCursorState && yCursorState.awarenessUpdated)
+        ) {
+          return createDecorations(
+            newState,
+            awareness,
+            awarenessStateFilter,
+            cursorBuilder,
+            selectionBuilder,
+          );
         }
-      } else if (current.cursor != null && relativePositionToAbsolutePosition(ystate.doc, ystate.type, Y__namespace.createRelativePositionFromJSON(current.cursor.anchor), ystate.binding.mapping) !== null) {
-        // delete cursor information if current cursor information is owned by this editor binding
-        awareness.setLocalStateField(cursorStateField, null);
-      }
-    };
-    awareness.on('change', awarenessListener);
-    view.dom.addEventListener('focusin', updateCursorInfo);
-    view.dom.addEventListener('focusout', updateCursorInfo);
-    return {
-      update: updateCursorInfo,
-      destroy: () => {
-        view.dom.removeEventListener('focusin', updateCursorInfo);
-        view.dom.removeEventListener('focusout', updateCursorInfo);
-        awareness.off('change', awarenessListener);
-        awareness.setLocalStateField(cursorStateField, null);
-      }
-    }
-  }
-});
+        return prevState.map(tr.mapping, tr.doc);
+      },
+    },
+    props: {
+      decorations: (state) => {
+        return yCursorPluginKey.getState(state);
+      },
+    },
+    view: (view) => {
+      const awarenessListener = () => {
+        // @ts-ignore
+        if (view.docView) {
+          setMeta(view, yCursorPluginKey, { awarenessUpdated: true });
+        }
+      };
+      const updateCursorInfo = () => {
+        const ystate = ySyncPluginKey.getState(view.state);
+        // @note We make implicit checks when checking for the cursor property
+        const current = awareness.getLocalState() || {};
+        if (view.hasFocus()) {
+          const selection = getSelection(view.state);
+          /**
+           * @type {Y.RelativePosition}
+           */
+          const anchor = absolutePositionToRelativePosition(
+            selection.anchor,
+            ystate.type,
+            ystate.binding.mapping,
+          );
+          /**
+           * @type {Y.RelativePosition}
+           */
+          const head = absolutePositionToRelativePosition(
+            selection.head,
+            ystate.type,
+            ystate.binding.mapping,
+          );
+          if (
+            current.cursor == null ||
+            !Y__namespace.compareRelativePositions(
+              Y__namespace.createRelativePositionFromJSON(current.cursor.anchor),
+              anchor,
+            ) ||
+            !Y__namespace.compareRelativePositions(
+              Y__namespace.createRelativePositionFromJSON(current.cursor.head),
+              head,
+            )
+          ) {
+            awareness.setLocalStateField(cursorStateField, {
+              anchor,
+              head,
+            });
+          }
+        } else if (
+          current.cursor != null &&
+          relativePositionToAbsolutePosition(
+            ystate.doc,
+            ystate.type,
+            Y__namespace.createRelativePositionFromJSON(current.cursor.anchor),
+            ystate.binding.mapping,
+          ) !== null
+        ) {
+          // delete cursor information if current cursor information is owned by this editor binding
+          awareness.setLocalStateField(cursorStateField, null);
+        }
+      };
+      awareness.on("change", awarenessListener);
+      view.dom.addEventListener("focusin", updateCursorInfo);
+      view.dom.addEventListener("focusout", updateCursorInfo);
+      return {
+        update: updateCursorInfo,
+        destroy: () => {
+          view.dom.removeEventListener("focusin", updateCursorInfo);
+          view.dom.removeEventListener("focusout", updateCursorInfo);
+          awareness.off("change", awarenessListener);
+          awareness.setLocalStateField(cursorStateField, null);
+        },
+      };
+    },
+  });
 
 const undo = state => {
   const undoManager = yUndoPluginKey.getState(state).undoManager;
@@ -1523,7 +2068,8 @@ const yUndoPlugin = ({ protectedNodes = defaultProtectedNodes, trackedOrigins = 
       const ystate = ySyncPluginKey.getState(state);
       const _undoManager = undoManager || new Y.UndoManager(ystate.type, {
         trackedOrigins: new Set([ySyncPluginKey].concat(trackedOrigins)),
-        deleteFilter: (item) => defaultDeleteFilter(item, protectedNodes)
+        deleteFilter: (item) => defaultDeleteFilter(item, protectedNodes),
+        captureTransaction: tr => tr.meta.get('addToHistory') !== false
       });
       return {
         undoManager: _undoManager,
@@ -1532,6 +2078,9 @@ const yUndoPlugin = ({ protectedNodes = defaultProtectedNodes, trackedOrigins = 
         hasRedoOps: _undoManager.redoStack.length > 0
       }
     },
+    /**
+     * @returns {any}
+     */
     apply: (tr, val, oldState, state) => {
       const binding = ySyncPluginKey.getState(state).binding;
       const undoManager = val.undoManager;
@@ -1582,11 +2131,13 @@ const yUndoPlugin = ({ protectedNodes = defaultProtectedNodes, trackedOrigins = 
 exports.ProsemirrorBinding = ProsemirrorBinding;
 exports.absolutePositionToRelativePosition = absolutePositionToRelativePosition;
 exports.createDecorations = createDecorations;
+exports.defaultAwarenessStateFilter = defaultAwarenessStateFilter;
 exports.defaultCursorBuilder = defaultCursorBuilder;
 exports.defaultDeleteFilter = defaultDeleteFilter;
 exports.defaultProtectedNodes = defaultProtectedNodes;
 exports.defaultSelectionBuilder = defaultSelectionBuilder;
 exports.getRelativeSelection = getRelativeSelection;
+exports.initProseMirrorDoc = initProseMirrorDoc;
 exports.isVisible = isVisible;
 exports.prosemirrorJSONToYDoc = prosemirrorJSONToYDoc;
 exports.prosemirrorJSONToYXmlFragment = prosemirrorJSONToYXmlFragment;
@@ -1596,6 +2147,7 @@ exports.redo = redo;
 exports.relativePositionToAbsolutePosition = relativePositionToAbsolutePosition;
 exports.setMeta = setMeta;
 exports.undo = undo;
+exports.updateYFragment = updateYFragment;
 exports.yCursorPlugin = yCursorPlugin;
 exports.yCursorPluginKey = yCursorPluginKey;
 exports.yDocToProsemirror = yDocToProsemirror;
@@ -1604,6 +2156,8 @@ exports.ySyncPlugin = ySyncPlugin;
 exports.ySyncPluginKey = ySyncPluginKey;
 exports.yUndoPlugin = yUndoPlugin;
 exports.yUndoPluginKey = yUndoPluginKey;
+exports.yXmlFragmentToProseMirrorFragment = yXmlFragmentToProseMirrorFragment;
+exports.yXmlFragmentToProseMirrorRootNode = yXmlFragmentToProseMirrorRootNode;
 exports.yXmlFragmentToProsemirror = yXmlFragmentToProsemirror;
 exports.yXmlFragmentToProsemirrorJSON = yXmlFragmentToProsemirrorJSON;
 //# sourceMappingURL=y-prosemirror.cjs.map
